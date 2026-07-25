@@ -52,6 +52,15 @@ def init_db():
         """)
 
 
+# Guaranteed at import time, not lazily inside create_job() - job_exists() and
+# every other reader can be (and is) called before any job has ever been
+# created in a fresh database (e.g. an old ?job_id=... still in the browser's
+# URL/session after a container restart wiped the previous SQLite file), and
+# must not crash with "no such table: jobs" when that happens. Idempotent
+# (CREATE TABLE IF NOT EXISTS), so calling it here is free.
+init_db()
+
+
 def _job_dir(job_id: str) -> str:
     d = os.path.join(JOBS_DIR, job_id)
     os.makedirs(d, exist_ok=True)
@@ -60,7 +69,6 @@ def _job_dir(job_id: str) -> str:
 
 
 def create_job() -> str:
-    init_db()
     job_id = str(uuid.uuid4())
     now = time.time()
     with _db() as conn:

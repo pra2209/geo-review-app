@@ -128,6 +128,21 @@ see this specific `KeyError`-from-`importlib` signature in the logs: same
 recovery (Reboot app), different cause (platform-level, not the
 `_log_error` issue).
 
+**A third incident, found the next time the app was launched**: a fresh
+deploy (the ephemeral filesystem, including the SQLite job index, is wiped
+on every container restart/reboot) crashed immediately on load with
+`OperationalError: no such table: jobs`. Cause: `init_db()` only ever ran
+inside `create_job()`, so `job_store.job_exists(job_id)` - called by `main()`
+on *every* page load when there's a `job_id` in the URL or browser session -
+could run against a table that had never been created, if the browser still
+had an old `job_id` cached from before the restart. Fixed by calling
+`init_db()` unconditionally at module import time (`src/job_store.py`),
+mirroring how `JOBS_DIR` is already guaranteed to exist at import time -
+readers no longer depend on a writer having run first in this process's
+lifetime. Regression test in `tests/test_job_store_fresh_db.py` reproduces a
+never-before-seen database and confirms `job_exists()` returns `False`
+instead of raising.
+
 ## Latency
 
 For a large multi-hundred-page PDF, review time was originally dominated by
