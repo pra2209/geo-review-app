@@ -184,6 +184,26 @@ def get_warnings(job_id: str, iteration: int) -> list[str]:
         return json.load(f)
 
 
+# --- Iteration-attempt errors (kept separate from job-fatal errors) ----------
+# A failed revision attempt should not strand the user without access to their
+# last GOOD iteration's findings/Excel - those files are untouched on disk.
+# This is a one-shot banner: read once by the results screen, then cleared.
+
+def save_iteration_error(job_id: str, message: str):
+    with open(os.path.join(_job_dir(job_id), "iteration_error.txt"), "w", encoding="utf-8") as f:
+        f.write(message)
+
+
+def pop_iteration_error(job_id: str) -> Optional[str]:
+    path = os.path.join(_job_dir(job_id), "iteration_error.txt")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        message = f.read()
+    os.remove(path)
+    return message
+
+
 def save_excel(job_id: str, iteration: int, excel_bytes: bytes) -> str:
     path = os.path.join(_job_dir(job_id), f"output_v{iteration}.xlsx")
     with open(path, "wb") as f:

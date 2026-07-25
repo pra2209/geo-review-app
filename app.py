@@ -216,7 +216,14 @@ def _start_iteration_bg(job_id: str, config: LLMConfig, overarching_comment: str
             job_store.set_iteration(job_id, next_iteration)
             job_store.set_status(job_id, "review_done", stage="Revision complete", current=1, total=1)
         except Exception as exc:  # noqa: BLE001
-            job_store.set_status(job_id, "error", error=str(exc))
+            # Don't strand the user on a dead-end error screen: the PRIOR
+            # iteration's findings/Excel are untouched on disk (we never
+            # called set_iteration for this failed attempt), so fall back to
+            # showing that instead of a fatal job-wide error.
+            job_store.save_iteration_error(job_id, str(exc))
+            job_store.set_status(job_id, "review_done",
+                                  stage="Revision attempt failed - showing your last good result",
+                                  current=1, total=1)
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -243,6 +250,11 @@ def render_results_screen(job_id: str, config: LLMConfig | None, iteration: int,
     findings = job_store.get_findings(job_id, iteration) or []
     excel_bytes = job_store.get_excel(job_id, iteration)
     warnings = job_store.get_warnings(job_id, iteration)
+    iteration_error = job_store.pop_iteration_error(job_id)
+
+    if iteration_error:
+        st.error(f"Your last revision attempt failed, so this is still your last successful "
+                  f"result (iteration {iteration}) - nothing was lost. Error was: {iteration_error}")
 
     st.header(f"5. Results (iteration {iteration})")
     if warnings:
