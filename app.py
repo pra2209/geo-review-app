@@ -8,6 +8,7 @@ finished.
 
 import threading
 import time
+import traceback
 
 import streamlit as st
 
@@ -25,6 +26,40 @@ STATUS_LABELS = {
     "D": "Rejected (critical)", "C": "Revise & Resubmit", "B": "Incorporate & Proceed",
     "A": "Proceed", "E": "Not Required",
 }
+
+
+def _log_error(job_id: str, stage: str, exc: Exception, config: LLMConfig | None = None,
+                extra: dict | None = None):
+    """Captures full diagnostic context for one error into the job's debug
+    log - never the API key, never PDF binary content. Intended to be handed
+    straight to Claude Code for debugging instead of copy-pasting a truncated
+    on-screen message."""
+    event = {
+        "stage": stage,
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+        "traceback": traceback.format_exc(),
+    }
+    if config is not None:
+        event["provider"] = config.provider
+        event["model"] = config.model
+    if extra:
+        event.update(extra)
+    job_store.append_debug_event(job_id, event)
+
+
+def _debug_log_download_button(job_id: str, key: str):
+    if job_store.has_debug_log(job_id):
+        st.download_button(
+            "Download error log (for debugging)",
+            data=job_store.get_debug_log_bytes(job_id),
+            file_name=f"debug_log_{job_id[:8]}.json",
+            mime="application/json",
+            key=key,
+            help="Full diagnostic detail - stage, traceback, raw model responses where "
+                 "available. Never includes your API key or PDF contents. Paste or upload "
+                 "this file directly when asking Claude Code to debug an issue.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +89,31 @@ def render_password_gate() -> bool:
 
 def render_llm_sidebar() -> LLMConfig | None:
     st.sidebar.header("LLM settings")
+
+    # Optional shared team key: if the deployer configured SHARED_PROVIDER /
+    # SHARED_MODEL / SHARED_{PROVIDER}_API_KEY in Secrets, teammates get a
+    # working config with zero setup - no personal API account needed. Pair
+    # this with a spend cap on that key in the provider's console; that cap,
+    # not which UI issues the calls, is what actually bounds cost. Falls back
+    # to today's BYOK-only flow untouched if none of this is configured.
+    shared_provider = st.secrets.get("SHARED_PROVIDER")
+    shared_model = st.secrets.get("SHARED_MODEL")
+    shared_key = None
+    if shared_provider == "anthropic":
+        shared_key = st.secrets.get("SHARED_ANTHROPIC_API_KEY")
+    elif shared_provider == "openai":
+        shared_key = st.secrets.get("SHARED_OPENAI_API_KEY")
+    shared_available = bool(shared_provider and shared_model and shared_key)
+
+    if shared_available:
+        use_own_key = st.sidebar.checkbox(
+            "Use your own API key instead of the shared team key",
+            value=st.session_state.get("use_own_key", False))
+        st.session_state["use_own_key"] = use_own_key
+        if not use_own_key:
+            st.sidebar.success(f"Using shared team key ({shared_provider}, {shared_model}).")
+            return LLMConfig(provider=shared_provider, model=shared_model, api_key=shared_key)
+
     provider = st.sidebar.selectbox("Provider", ["anthropic", "openai"])
     model = st.sidebar.selectbox("Model", ALLOWED_MODELS[provider],
                                   index=ALLOWED_MODELS[provider].index(DEFAULT_MODEL[provider]))
@@ -121,6 +181,7 @@ def _start_summarization_bg(job_id: str, config: LLMConfig):
             job_store.save_summary(job_id, summary)
             job_store.set_status(job_id, "summarized", stage="Summary ready", current=1, total=1)
         except Exception as exc:  # noqa: BLE001
+            _log_error(job_id, "summarizing", exc, config)
             job_store.set_status(job_id, "error", error=str(exc))
 
     threading.Thread(target=_run, daemon=True).start()
@@ -170,14 +231,19 @@ def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, it
             findings, chunk_errors = run_first_pass(
                 config, digest, chunks, extra_instructions or None, progress_cb=progress_cb)
 
+            for ce in chunk_errors:
+                job_store.append_debug_event(job_id, {"stage": "reviewing_chunk", **ce,
+                                                        "provider": config.provider, "model": config.model})
+
             if not findings and chunk_errors:
                 # Every chunk failed - nothing to show, this really is fatal.
-                job_store.set_status(job_id, "error",
-                                      error="All chunks failed:\n" + "\n".join(chunk_errors))
+                job_store.set_status(
+                    job_id, "error",
+                    error="All chunks failed:\n" + "\n".join(ce["error"] for ce in chunk_errors))
                 return
 
             job_store.save_findings(job_id, iteration, findings)
-            job_store.save_warnings(job_id, iteration, chunk_errors)
+            job_store.save_warnings(job_id, iteration, [ce["error"] for ce in chunk_errors])
             excel_bytes = write_excel(findings, job_id)
             job_store.save_excel(job_id, iteration, excel_bytes)
             job_store.set_iteration(job_id, iteration)
@@ -185,6 +251,7 @@ def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, it
                 f"Review complete with {len(chunk_errors)} section(s) needing a retry - see warnings below")
             job_store.set_status(job_id, "review_done", stage=stage, current=1, total=1)
         except Exception as exc:  # noqa: BLE001
+            _log_error(job_id, "reviewing", exc, config)
             job_store.set_status(job_id, "error", error=str(exc))
 
     threading.Thread(target=_run, daemon=True).start()
@@ -220,6 +287,7 @@ def _start_iteration_bg(job_id: str, config: LLMConfig, overarching_comment: str
             # iteration's findings/Excel are untouched on disk (we never
             # called set_iteration for this failed attempt), so fall back to
             # showing that instead of a fatal job-wide error.
+            _log_error(job_id, "iterating", exc, config)
             job_store.save_iteration_error(job_id, str(exc))
             job_store.set_status(job_id, "review_done",
                                   stage="Revision attempt failed - showing your last good result",
@@ -255,6 +323,7 @@ def render_results_screen(job_id: str, config: LLMConfig | None, iteration: int,
     if iteration_error:
         st.error(f"Your last revision attempt failed, so this is still your last successful "
                   f"result (iteration {iteration}) - nothing was lost. Error was: {iteration_error}")
+        _debug_log_download_button(job_id, key="iteration_error_debug_log")
 
     st.header(f"5. Results (iteration {iteration})")
     if warnings:
@@ -268,6 +337,7 @@ def render_results_screen(job_id: str, config: LLMConfig | None, iteration: int,
                 "Re-running the review (or a Revise Review iteration once the rest looks good) "
                 "will retry that content."
             )
+            _debug_log_download_button(job_id, key="warnings_debug_log")
     counts = {}
     for f in findings:
         counts[f.status] = counts.get(f.status, 0) + 1
@@ -346,6 +416,7 @@ def main():
 
     if status["status"] == "error":
         st.error(f"Something went wrong: {status['error_message']}")
+        _debug_log_download_button(job_id, key="error_screen_debug_log")
         if st.button("Start over"):
             st.session_state.pop("job_id", None)
             st.query_params.clear()

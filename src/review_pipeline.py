@@ -13,12 +13,13 @@ README as a v2 improvement (full re-chunk on iteration).
 
 import json
 import re
+import traceback
 import uuid
 from dataclasses import dataclass
 from typing import Optional
 
 from src.config import FRAMEWORK_PATH, REVIEW_MAX_TOKENS
-from src.llm_client import LLMConfig, call
+from src.llm_client import LLMConfig, call_with_cache
 from src.pdf_processing import Page, render_pages_as_text
 
 
@@ -124,14 +125,22 @@ def _findings_from_json(items: list[dict]) -> list[Finding]:
 def run_first_pass(config: LLMConfig, digest_pages: list[Page],
                     chunks: list[list[Page]],
                     extra_instructions: Optional[str] = None,
-                    progress_cb=None) -> tuple[list[Finding], list[str]]:
+                    progress_cb=None) -> tuple[list[Finding], list[dict]]:
     """One LLM call per chunk. progress_cb(done, total) if provided, for the UI progress bar.
 
     Each chunk's call/parse is isolated: a failure on one chunk (truncated
     response, transient API error, etc.) does not discard findings already
     obtained from OTHER chunks that already cost real API spend. Returns
-    (findings, chunk_errors) - chunk_errors is a list of human-readable
-    strings, one per failed chunk, empty if everything succeeded.
+    (findings, chunk_errors) - chunk_errors is a list of dicts with keys
+    chunk, total, error, error_type, and raw_response (None if the call
+    itself failed before any text came back), empty if everything succeeded.
+    The full dicts are meant for the debug log; callers wanting a short
+    on-screen message should read the "error" key.
+
+    Cost note: framework_text (system prompt) and cacheable_context (digest)
+    below are byte-identical across every chunk call in this loop - that's
+    exactly what prompt caching needs to kick in on repeat calls after the
+    first. Only the per-chunk dynamic_content varies.
     """
     framework_text = load_framework()
     if extra_instructions:
@@ -141,25 +150,36 @@ def run_first_pass(config: LLMConfig, digest_pages: list[Page],
         )
 
     digest_text = render_pages_as_text(digest_pages)
+    cacheable_context = (
+        "PROJECT DIGEST (opening pages of each source file, for cross-reference / "
+        f"traceability checks only - do not re-review this section on its own):\n{digest_text}"
+    )
     all_findings: list[Finding] = []
-    chunk_errors: list[str] = []
+    chunk_errors: list[dict] = []
     total = len(chunks)
 
     for i, chunk in enumerate(chunks, start=1):
         chunk_text = render_pages_as_text(chunk)
-        user_prompt = (
-            "PROJECT DIGEST (opening pages of each source file, for cross-reference / "
-            f"traceability checks only - do not re-review this section on its own):\n{digest_text}\n\n"
+        dynamic_content = (
             f"DETAILED SECTION TO REVIEW NOW (chunk {i} of {total}):\n{chunk_text}\n\n"
             "Review this chunk against all 14 steps that apply to its content, using the digest "
             "for traceability where needed. Return the JSON findings array now."
         )
+        raw = None
         try:
-            raw = call(config, framework_text, user_prompt, max_tokens=REVIEW_MAX_TOKENS)
+            raw = call_with_cache(config, framework_text, cacheable_context, dynamic_content,
+                                   max_tokens=REVIEW_MAX_TOKENS)
             items = _extract_json_array(raw)
             all_findings.extend(_findings_from_json(items))
         except Exception as exc:  # noqa: BLE001 - one bad chunk must not sink the job
-            chunk_errors.append(f"Chunk {i} of {total} failed: {exc}")
+            chunk_errors.append({
+                "chunk": i,
+                "total": total,
+                "error": f"Chunk {i} of {total} failed: {exc}",
+                "error_type": type(exc).__name__,
+                "traceback": traceback.format_exc(),
+                "raw_response": raw,  # full text if the call returned one but parsing failed
+            })
         if progress_cb:
             progress_cb(i, total)
 
@@ -176,6 +196,11 @@ def run_iteration(config: LLMConfig, digest_pages: list[Page],
     """
     framework_text = load_framework()
     digest_text = render_pages_as_text(digest_pages)
+    # Same framework_text + digest shape as run_first_pass, on purpose: if this
+    # iteration is requested shortly after the first-pass chunk calls for the
+    # same job, it may still land inside the ~5 minute cache window and get a
+    # partial cache hit even though this is otherwise a single, one-off call.
+    cacheable_context = f"PROJECT DIGEST:\n{digest_text}"
 
     prior_json = json.dumps([{
         "finding_id": f.finding_id,
@@ -190,9 +215,8 @@ def run_iteration(config: LLMConfig, digest_pages: list[Page],
         "reviewer_comment": f.reviewer_comment,
     } for f in prior_findings], indent=2)
 
-    user_prompt = (
+    dynamic_content = (
         "This is a REVISION pass (iteration mode - see instructions above).\n\n"
-        f"PROJECT DIGEST:\n{digest_text}\n\n"
         f"PRIOR FINDINGS (with any reviewer_comment the user added per row):\n{prior_json}\n\n"
         f"OVERARCHING COMMENT FOR THIS ITERATION: {overarching_comment or '(none provided)'}\n\n"
         "Apply the iteration-mode rules: keep finding_id stable where a finding is unchanged, "
@@ -204,7 +228,8 @@ def run_iteration(config: LLMConfig, digest_pages: list[Page],
 
     if progress_cb:
         progress_cb(0, 1)
-    raw = call(config, framework_text, user_prompt, max_tokens=REVIEW_MAX_TOKENS)
+    raw = call_with_cache(config, framework_text, cacheable_context, dynamic_content,
+                           max_tokens=REVIEW_MAX_TOKENS)
     items = _extract_json_array(raw)
 
     # Preserve finding_id when the model echoes one that matches a prior finding.

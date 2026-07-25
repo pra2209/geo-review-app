@@ -38,6 +38,43 @@ Anthropic or OpenAI API key in the sidebar, validate it, then upload PDFs.
    `.streamlit/secrets.toml` (at minimum `ACCESS_CODE`).
 4. Deploy. Share the URL + access code with whoever should use it.
 
+### Letting teammates use it without their own API key
+
+Set `SHARED_PROVIDER` / `SHARED_MODEL` / `SHARED_ANTHROPIC_API_KEY` (or
+`SHARED_OPENAI_API_KEY`) in Secrets — see the commented example in
+`.streamlit/secrets.toml.example`. Anyone behind the access code then gets a
+working config automatically, with an option in the sidebar to override with
+their own key instead. **Set a hard monthly spend cap + alert on that key in
+the provider's console** — that cap is what actually bounds cost exposure,
+not which product/UI is issuing the calls (Claude Code, claude.ai, and this
+app all ultimately call the same metered Anthropic/OpenAI API — none of them
+is a free backend for a separate application).
+
+## Cost & reliability
+
+- **Prompt caching**: the framework instructions (system prompt) and document
+  digest are byte-identical across every chunk call within a job — both are
+  marked as cacheable (`src/providers/anthropic_provider.py::call_with_cache`,
+  used for all review/iteration calls via `src/llm_client.py`). Anthropic
+  caches explicitly via `cache_control`; OpenAI caches these same repeated
+  prefixes automatically server-side. Meaningfully cuts cost on multi-chunk
+  documents. Verified via mocked request-payload tests in
+  `tests/test_prompt_caching.py` (can't verify an actual cache *hit* without
+  a live key — that shows up in the provider's usage dashboard as
+  `cache_read_input_tokens` / cached-token counts on the 2nd+ call).
+- **Per-chunk resilience**: if one chunk's response gets cut off (hit the
+  token limit) or otherwise fails to parse, that chunk's findings are
+  skipped — every other chunk's findings (already paid for) are kept, not
+  discarded. Partial results are surfaced as dismissable warnings on the
+  results screen, not a job-killing error. Same principle applies to a failed
+  "Revise Review" iteration: it falls back to your last successful result
+  instead of a dead-end error screen.
+- **Debug log**: any error or per-chunk warning gets a "Download error log"
+  button next to it — a JSON bundle with full traceback, the raw model
+  response where available, and provider/model (never your API key or PDF
+  contents). Hand that file directly to Claude Code instead of copy-pasting a
+  truncated on-screen message.
+
 ## What's intentionally simplified in this MVP (read before relying on it)
 
 - **Anthropic Zero Data Retention / enterprise agreement**: not in place.
@@ -95,9 +132,11 @@ the current functions are already structured to make that split easy later.
 
 ## Known TODOs before this is "done" rather than "working"
 
-- No automated tests yet (`tests/` exists but is empty) — at minimum, unit
-  test `excel_io` round-trip (write then read back the same findings) and
-  `review_pipeline._extract_json_array` against malformed LLM output.
-- No retry/backoff on LLM calls — a transient API error currently fails the
-  whole job with a raw error message shown to the user.
+- Tests cover Excel round-trip, JSON-truncation salvage/error behavior, and
+  the caching request payloads (`tests/`) — not yet: `pdf_processing`,
+  `job_store`, or the Streamlit screens themselves (those were smoke-tested
+  manually against a real DP05 report, not under automated test).
+- No automatic retry of a failed chunk — a chunk that fails is skipped and
+  surfaced as a warning; retrying it currently means re-running the review or
+  a Revise Review iteration, not an automatic in-job retry.
 - No rate limiting / abuse protection beyond the shared access code.

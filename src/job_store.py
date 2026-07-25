@@ -184,6 +184,51 @@ def get_warnings(job_id: str, iteration: int) -> list[str]:
         return json.load(f)
 
 
+# --- Debug log ---------------------------------------------------------------
+# Every error/warning event gets appended here (full traceback, raw LLM
+# response where available, which stage/chunk it happened in). Never includes
+# the API key or uploaded PDF binary content - only filenames/page counts and
+# whatever the pipeline itself generated (prompts, responses, findings).
+# Downloadable as one bundle so the user can hand it over instead of
+# copy-pasting a truncated error message.
+
+def append_debug_event(job_id: str, event: dict):
+    event = {**event, "timestamp": time.time()}
+    path = os.path.join(_job_dir(job_id), "debug_log.json")
+    events = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            try:
+                events = json.load(f)
+            except json.JSONDecodeError:
+                events = []
+    events.append(event)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(events, f, indent=2, default=str)
+
+
+def has_debug_log(job_id: str) -> bool:
+    return os.path.exists(os.path.join(_job_dir(job_id), "debug_log.json"))
+
+
+def get_debug_log_bytes(job_id: str) -> bytes:
+    path = os.path.join(_job_dir(job_id), "debug_log.json")
+    events = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            events = json.load(f)
+    bundle = {
+        "_note": (
+            "Debug log for this review job. Does NOT include your API key or the "
+            "uploaded PDF file contents (only filenames/page counts are logged). "
+            "Safe to share for debugging - paste this whole file to Claude Code."
+        ),
+        "job_id": job_id,
+        "events": events,
+    }
+    return json.dumps(bundle, indent=2, default=str).encode("utf-8")
+
+
 # --- Iteration-attempt errors (kept separate from job-fatal errors) ----------
 # A failed revision attempt should not strand the user without access to their
 # last GOOD iteration's findings/Excel - those files are untouched on disk.

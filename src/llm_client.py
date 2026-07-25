@@ -45,6 +45,19 @@ def call(config: LLMConfig, system_prompt: str, user_prompt: str,
     return module.call(config.api_key, config.model, system_prompt, user_prompt, max_tokens)
 
 
+def call_with_cache(config: LLMConfig, system_prompt: str, cacheable_context: str,
+                     dynamic_content: str, max_tokens: int = 8192) -> str:
+    """Use when the same system_prompt + cacheable_context will be sent again
+    on a subsequent call within the same job (e.g. one chunk call per section
+    of a document, all sharing the same framework instructions + digest) -
+    cuts real cost on the repeated portion. See each provider module for how
+    caching is actually achieved (explicit cache_control for Anthropic,
+    automatic server-side for OpenAI)."""
+    module = _PROVIDERS[config.provider]
+    return module.call_with_cache(config.api_key, config.model, system_prompt,
+                                   cacheable_context, dynamic_content, max_tokens)
+
+
 def validate_key(config: LLMConfig) -> tuple[bool, str]:
     module = _PROVIDERS[config.provider]
     return module.validate_key(config.api_key, config.model)
