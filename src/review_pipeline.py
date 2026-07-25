@@ -14,10 +14,10 @@ README as a v2 improvement (full re-chunk on iteration).
 import json
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
-from src.config import FRAMEWORK_PATH
+from src.config import FRAMEWORK_PATH, REVIEW_MAX_TOKENS
 from src.llm_client import LLMConfig, call
 from src.pdf_processing import Page, render_pages_as_text
 
@@ -42,22 +42,66 @@ def load_framework() -> str:
         return f.read()
 
 
+class TruncatedResponseError(ValueError):
+    """Raised when a model response could not yield any usable findings -
+    typically because it was cut off (hit max_tokens) before completing even
+    one finding object. Distinct from a generic parse error so callers can
+    decide whether to treat it as fatal or just "this chunk got nothing"."""
+
+
 def _extract_json_array(raw_text: str) -> list[dict]:
-    """LLMs sometimes wrap JSON in markdown fences or add stray prose. Extract
-    the first top-level JSON array robustly."""
+    """Extract finding objects from the model's response, tolerating a
+    response that got cut off mid-generation (hit max_tokens) rather than
+    failing the whole chunk. Strategy:
+
+    1. Strip a markdown code fence if present (opening AND/OR closing - a
+       truncated response may have the opening fence but never reach a
+       closing one).
+    2. Try a fast, direct json.loads() first - handles the common
+       well-formed case with zero overhead.
+    3. If that fails, walk the text looking for top-level `{...}` objects
+       and decode each independently via json.JSONDecoder.raw_decode(). Any
+       objects that finished generating are kept; a final, incomplete object
+       (the one that was mid-flight when the response got cut off) is
+       silently dropped rather than poisoning the whole batch.
+
+    Raises TruncatedResponseError only if NOT EVEN ONE complete object could
+    be recovered (e.g. cut off during the very first finding).
+    """
     text = raw_text.strip()
-    fence_match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
-    if fence_match:
-        text = fence_match.group(1)
-    else:
-        start = text.find("[")
-        end = text.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            text = text[start:end + 1]
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```\s*$", "", text)
+
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Could not parse findings JSON from model output: {exc}\nRaw: {raw_text[:500]}")
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return parsed
+        # A single object rather than an array - still usable.
+        return [parsed]
+    except json.JSONDecodeError:
+        pass
+
+    objects: list[dict] = []
+    decoder = json.JSONDecoder()
+    search_pos = text.find("{")
+    while search_pos != -1:
+        try:
+            obj, end_pos = decoder.raw_decode(text, search_pos)
+            objects.append(obj)
+            search_pos = text.find("{", end_pos)
+        except json.JSONDecodeError:
+            # The object starting here is incomplete/malformed - this is
+            # expected at the tail of a truncated response. Stop; anything
+            # found before this point is still good.
+            break
+
+    if not objects:
+        raise TruncatedResponseError(
+            "Model response ended before any finding finished generating "
+            "(likely hit the output token limit on the very first item). "
+            f"Raw response (first 1500 chars): {raw_text[:1500]}"
+        )
+    return objects
 
 
 def _findings_from_json(items: list[dict]) -> list[Finding]:
@@ -80,8 +124,15 @@ def _findings_from_json(items: list[dict]) -> list[Finding]:
 def run_first_pass(config: LLMConfig, digest_pages: list[Page],
                     chunks: list[list[Page]],
                     extra_instructions: Optional[str] = None,
-                    progress_cb=None) -> list[Finding]:
-    """One LLM call per chunk. progress_cb(done, total) if provided, for the UI progress bar."""
+                    progress_cb=None) -> tuple[list[Finding], list[str]]:
+    """One LLM call per chunk. progress_cb(done, total) if provided, for the UI progress bar.
+
+    Each chunk's call/parse is isolated: a failure on one chunk (truncated
+    response, transient API error, etc.) does not discard findings already
+    obtained from OTHER chunks that already cost real API spend. Returns
+    (findings, chunk_errors) - chunk_errors is a list of human-readable
+    strings, one per failed chunk, empty if everything succeeded.
+    """
     framework_text = load_framework()
     if extra_instructions:
         framework_text += (
@@ -91,6 +142,7 @@ def run_first_pass(config: LLMConfig, digest_pages: list[Page],
 
     digest_text = render_pages_as_text(digest_pages)
     all_findings: list[Finding] = []
+    chunk_errors: list[str] = []
     total = len(chunks)
 
     for i, chunk in enumerate(chunks, start=1):
@@ -102,13 +154,16 @@ def run_first_pass(config: LLMConfig, digest_pages: list[Page],
             "Review this chunk against all 14 steps that apply to its content, using the digest "
             "for traceability where needed. Return the JSON findings array now."
         )
-        raw = call(config, framework_text, user_prompt, max_tokens=8192)
-        items = _extract_json_array(raw)
-        all_findings.extend(_findings_from_json(items))
+        try:
+            raw = call(config, framework_text, user_prompt, max_tokens=REVIEW_MAX_TOKENS)
+            items = _extract_json_array(raw)
+            all_findings.extend(_findings_from_json(items))
+        except Exception as exc:  # noqa: BLE001 - one bad chunk must not sink the job
+            chunk_errors.append(f"Chunk {i} of {total} failed: {exc}")
         if progress_cb:
             progress_cb(i, total)
 
-    return all_findings
+    return all_findings, chunk_errors
 
 
 def run_iteration(config: LLMConfig, digest_pages: list[Page],
@@ -149,7 +204,7 @@ def run_iteration(config: LLMConfig, digest_pages: list[Page],
 
     if progress_cb:
         progress_cb(0, 1)
-    raw = call(config, framework_text, user_prompt, max_tokens=8192)
+    raw = call(config, framework_text, user_prompt, max_tokens=REVIEW_MAX_TOKENS)
     items = _extract_json_array(raw)
 
     # Preserve finding_id when the model echoes one that matches a prior finding.

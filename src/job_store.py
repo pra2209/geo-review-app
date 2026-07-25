@@ -166,6 +166,24 @@ def get_findings(job_id: str, iteration: int) -> Optional[list[Finding]]:
     return [Finding(**item) for item in raw]
 
 
+def save_warnings(job_id: str, iteration: int, warnings: list[str]):
+    """Non-fatal issues from this iteration's run (e.g. a chunk whose response
+    got truncated) - surfaced to the user alongside the findings that DID
+    come back cleanly, rather than failing the whole job.
+    """
+    path = os.path.join(_job_dir(job_id), f"warnings_v{iteration}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(warnings, f, indent=2)
+
+
+def get_warnings(job_id: str, iteration: int) -> list[str]:
+    path = os.path.join(_job_dir(job_id), f"warnings_v{iteration}.json")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def save_excel(job_id: str, iteration: int, excel_bytes: bytes) -> str:
     path = os.path.join(_job_dir(job_id), f"output_v{iteration}.xlsx")
     with open(path, "wb") as f:

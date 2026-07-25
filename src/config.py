@@ -30,6 +30,15 @@ DEFAULT_MODEL = {
     "openai": "gpt-4.1",
 }
 
+# --- LLM call tuning ----------------------------------------------------------
+# Bumped from an earlier 8192: a busy chunk with many findings (each review_comment
+# runs 150-400 words per the framework instructions) can legitimately need more
+# room, and a too-tight budget causes the model to cut a finding off mid-generation
+# rather than finishing cleanly. See review_pipeline._extract_json_array for the
+# complementary fix: even if truncation still happens, complete findings are
+# salvaged instead of the whole chunk's output being discarded.
+REVIEW_MAX_TOKENS = 16000
+
 # --- Upload limits -----------------------------------------------------------
 MAX_FILES_PER_JOB = 5
 # Streamlit's own per-file/per-request cap is set in .streamlit/config.toml

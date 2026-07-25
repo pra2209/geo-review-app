@@ -167,14 +167,23 @@ def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, it
                                       stage=f"Reviewing section {done} of {total}...",
                                       current=done, total=total)
 
-            findings = run_first_pass(config, digest, chunks, extra_instructions or None,
-                                       progress_cb=progress_cb)
+            findings, chunk_errors = run_first_pass(
+                config, digest, chunks, extra_instructions or None, progress_cb=progress_cb)
+
+            if not findings and chunk_errors:
+                # Every chunk failed - nothing to show, this really is fatal.
+                job_store.set_status(job_id, "error",
+                                      error="All chunks failed:\n" + "\n".join(chunk_errors))
+                return
+
             job_store.save_findings(job_id, iteration, findings)
+            job_store.save_warnings(job_id, iteration, chunk_errors)
             excel_bytes = write_excel(findings, job_id)
             job_store.save_excel(job_id, iteration, excel_bytes)
             job_store.set_iteration(job_id, iteration)
-            job_store.set_status(job_id, "review_done", stage="Review complete",
-                                  current=1, total=1)
+            stage = "Review complete" if not chunk_errors else (
+                f"Review complete with {len(chunk_errors)} section(s) needing a retry - see warnings below")
+            job_store.set_status(job_id, "review_done", stage=stage, current=1, total=1)
         except Exception as exc:  # noqa: BLE001
             job_store.set_status(job_id, "error", error=str(exc))
 
@@ -233,8 +242,20 @@ def render_progress_screen(status: dict):
 def render_results_screen(job_id: str, config: LLMConfig | None, iteration: int, finished: bool):
     findings = job_store.get_findings(job_id, iteration) or []
     excel_bytes = job_store.get_excel(job_id, iteration)
+    warnings = job_store.get_warnings(job_id, iteration)
 
     st.header(f"5. Results (iteration {iteration})")
+    if warnings:
+        with st.expander(f"⚠️ {len(warnings)} section(s) had a problem and were skipped "
+                          "(findings below are still complete for everything that succeeded)",
+                          expanded=False):
+            for w in warnings:
+                st.warning(w)
+            st.caption(
+                "This usually means the model's response for that section got cut off. "
+                "Re-running the review (or a Revise Review iteration once the rest looks good) "
+                "will retry that content."
+            )
     counts = {}
     for f in findings:
         counts[f.status] = counts.get(f.status, 0) + 1
