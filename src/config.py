@@ -23,11 +23,18 @@ ALLOWED_MODELS = {
         "o3",
         "o4-mini",
     ],
+    "gemini": [
+        "gemini-2.5-pro",
+        "gemini-3.1-pro-preview",
+    ],
 }
 
 DEFAULT_MODEL = {
     "anthropic": "claude-sonnet-5",
     "openai": "gpt-4.1",
+    # Cheaper than 3.1 Pro Preview and still a genuine reasoning-tier model
+    # (not a Flash/Flash-Lite variant) - see cost comparison in README.
+    "gemini": "gemini-2.5-pro",
 }
 
 # --- LLM call tuning ----------------------------------------------------------

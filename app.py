@@ -103,6 +103,8 @@ def render_llm_sidebar() -> LLMConfig | None:
         shared_key = st.secrets.get("SHARED_ANTHROPIC_API_KEY")
     elif shared_provider == "openai":
         shared_key = st.secrets.get("SHARED_OPENAI_API_KEY")
+    elif shared_provider == "gemini":
+        shared_key = st.secrets.get("SHARED_GEMINI_API_KEY")
     shared_available = bool(shared_provider and shared_model and shared_key)
 
     if shared_available:
@@ -114,14 +116,16 @@ def render_llm_sidebar() -> LLMConfig | None:
             st.sidebar.success(f"Using shared team key ({shared_provider}, {shared_model}).")
             return LLMConfig(provider=shared_provider, model=shared_model, api_key=shared_key)
 
-    provider = st.sidebar.selectbox("Provider", ["anthropic", "openai"])
+    provider = st.sidebar.selectbox("Provider", ["anthropic", "openai", "gemini"])
     model = st.sidebar.selectbox("Model", ALLOWED_MODELS[provider],
                                   index=ALLOWED_MODELS[provider].index(DEFAULT_MODEL[provider]))
     api_key = st.sidebar.text_input("API key (yours - not stored)", type="password",
                                      value=st.session_state.get("api_key", ""))
     st.sidebar.caption(
         "Only reasoning-capable models are listed - small/fast models are excluded because "
-        "this review requires multi-step standards reasoning."
+        "this review requires multi-step standards reasoning. Gemini keys come from Google AI "
+        "Studio (aistudio.google.com/apikey) - the free tier works but uses your content to "
+        "improve Google's products; paid tier turns that off, same as the other providers."
     )
     if st.sidebar.button("Validate key"):
         if not api_key:

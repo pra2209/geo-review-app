@@ -7,11 +7,12 @@ session - never written to disk, never logged, never persisted to the job DB.
 from dataclasses import dataclass
 
 from src.config import ALLOWED_MODELS
-from src.providers import anthropic_provider, openai_provider
+from src.providers import anthropic_provider, openai_provider, gemini_provider
 
 _PROVIDERS = {
     "anthropic": anthropic_provider,
     "openai": openai_provider,
+    "gemini": gemini_provider,
 }
 
 
@@ -25,7 +26,7 @@ class UnknownProviderError(ValueError):
 
 @dataclass
 class LLMConfig:
-    provider: str  # "anthropic" | "openai"
+    provider: str  # "anthropic" | "openai" | "gemini"
     model: str
     api_key: str
 
@@ -52,7 +53,7 @@ def call_with_cache(config: LLMConfig, system_prompt: str, cacheable_context: st
     of a document, all sharing the same framework instructions + digest) -
     cuts real cost on the repeated portion. See each provider module for how
     caching is actually achieved (explicit cache_control for Anthropic,
-    automatic server-side for OpenAI)."""
+    automatic server-side for OpenAI and Gemini)."""
     module = _PROVIDERS[config.provider]
     return module.call_with_cache(config.api_key, config.model, system_prompt,
                                    cacheable_context, dynamic_content, max_tokens)

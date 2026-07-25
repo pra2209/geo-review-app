@@ -25,7 +25,8 @@ streamlit run app.py
 ```
 
 Open the URL Streamlit prints. Enter the access code, paste your own
-Anthropic or OpenAI API key in the sidebar, validate it, then upload PDFs.
+Anthropic, OpenAI, or Gemini API key in the sidebar, validate it, then
+upload PDFs.
 
 ## Deploying to Streamlit Community Cloud
 
@@ -50,13 +51,30 @@ not which product/UI is issuing the calls (Claude Code, claude.ai, and this
 app all ultimately call the same metered Anthropic/OpenAI API — none of them
 is a free backend for a separate application).
 
+## Model & cost comparison (checked live, July 2026 — verify before relying on it, this moves fast)
+
+| Provider / model | Input $/1M | Output $/1M | Notes |
+|---|---|---|---|
+| **Gemini 2.5 Pro** | $1.25 (≤200k ctx) | $10.00 | Cheapest of the three below; still GA/stable, genuine reasoning tier, not a Flash/Lite variant |
+| Gemini 3.1 Pro Preview | $2.00 (≤200k ctx) | $12.00 | Newer/stronger, but *not* the cheap Gemini option — don't assume "Gemini" is uniformly cheaper |
+| Claude Sonnet 5 (default) | $2 → $3 after 31 Aug 2026 | $10 → $15 after 31 Aug 2026 | Intro pricing window closing soon |
+| GPT-4.1 | $2.00 | $8.00 | |
+
+Gemini access: free tier at [aistudio.google.com](https://aistudio.google.com/apikey) works
+with no billing setup, but your content is used to improve Google's products on that tier —
+same tradeoff as any provider's free tier. Use paid tier for anything with real project data.
+
+If cost is the main thing stopping your team from adopting this, **Gemini 2.5 Pro as the
+shared team key** (see below) is the lowest-friction fix — cheaper per call than either
+current default, still clears the reasoning-capability bar the allowlist enforces.
+
 ## Cost & reliability
 
 - **Prompt caching**: the framework instructions (system prompt) and document
   digest are byte-identical across every chunk call within a job — both are
-  marked as cacheable (`src/providers/anthropic_provider.py::call_with_cache`,
-  used for all review/iteration calls via `src/llm_client.py`). Anthropic
-  caches explicitly via `cache_control`; OpenAI caches these same repeated
+  marked as cacheable (`call_with_cache` in each provider module, used for
+  all review/iteration calls via `src/llm_client.py`). Anthropic caches
+  explicitly via `cache_control`; OpenAI and Gemini cache these same repeated
   prefixes automatically server-side. Meaningfully cuts cost on multi-chunk
   documents. Verified via mocked request-payload tests in
   `tests/test_prompt_caching.py` (can't verify an actual cache *hit* without
@@ -120,7 +138,8 @@ src/review_pipeline.py        Core 14-step review + iteration logic, Finding dat
 src/excel_io.py                Write/read the MODON CRS Excel format
 src/job_store.py              SQLite job index + per-job files on disk
 src/llm_client.py             Provider-agnostic LLM call + model allowlist enforcement
-src/providers/                Anthropic / OpenAI thin wrappers
+src/providers/                Anthropic / OpenAI / Gemini thin wrappers (Gemini via Google's
+                               OpenAI-compatible endpoint, not a separate native SDK)
 framework/review_instructions.md   The 14-step logic, as fed to the LLM (edit this to
                                     change review behavior — no code change needed)
 ```

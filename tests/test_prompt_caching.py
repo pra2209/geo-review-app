@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.providers import anthropic_provider, openai_provider
+from src.providers import anthropic_provider, openai_provider, gemini_provider
 
 
 def _fake_anthropic_response(text="[]"):
@@ -110,8 +110,47 @@ def test_openai_call_with_cache_preserves_prefix_order():
         print("test_openai_call_with_cache_preserves_prefix_order: OK")
 
 
+def test_gemini_uses_google_endpoint_not_openais():
+    """Guards against the one plausible copy-paste bug in this provider:
+    forgetting the custom base_url and silently sending Gemini-labeled calls
+    to OpenAI's actual API (which would just fail with an unknown-model
+    error at best, or - worse - quietly charge the wrong account if a
+    fallback key were ever present)."""
+    with patch("src.providers.gemini_provider.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="[]"))]
+        )
+        gemini_provider.call(api_key="fake-gemini-key", model="gemini-2.5-pro",
+                              system_prompt="sys", user_prompt="usr")
+        _, kwargs = MockClient.call_args
+        assert kwargs["base_url"] == gemini_provider.GEMINI_BASE_URL
+        assert "openai.com" not in kwargs["base_url"]
+        print("test_gemini_uses_google_endpoint_not_openais: OK")
+
+
+def test_gemini_call_with_cache_preserves_prefix_order():
+    with patch("src.providers.gemini_provider.OpenAI") as MockClient:
+        instance = MockClient.return_value
+        instance.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="[]"))]
+        )
+
+        gemini_provider.call_with_cache(
+            api_key="fake-key", model="gemini-2.5-pro",
+            system_prompt="FRAMEWORK", cacheable_context="DIGEST", dynamic_content="CHUNK 1",
+        )
+
+        call_kwargs = instance.chat.completions.create.call_args.kwargs
+        user_message = call_kwargs["messages"][1]["content"]
+        assert user_message.startswith("DIGEST")
+        assert user_message.endswith("CHUNK 1")
+        print("test_gemini_call_with_cache_preserves_prefix_order: OK")
+
+
 if __name__ == "__main__":
     test_anthropic_call_with_cache_marks_system_and_context_as_ephemeral()
     test_anthropic_call_with_cache_is_stable_across_repeated_calls()
     test_openai_call_with_cache_preserves_prefix_order()
+    test_gemini_uses_google_endpoint_not_openais()
+    test_gemini_call_with_cache_preserves_prefix_order()
     print("All tests passed.")
