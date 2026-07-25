@@ -68,6 +68,43 @@ If cost is the main thing stopping your team from adopting this, **Gemini 2.5 Pr
 shared team key** (see below) is the lowest-friction fix — cheaper per call than either
 current default, still clears the reasoning-capability bar the allowlist enforces.
 
+## Latency
+
+For a large multi-hundred-page PDF, review time was originally dominated by
+strictly sequential chunk processing - one full LLM round trip after another,
+with no explicit request timeout. Fixed via:
+
+- **Concurrent chunk processing** (`CHUNK_CONCURRENCY` in `src/config.py`,
+  default 4): chunks run through a bounded worker pool instead of one at a
+  time - wall-clock is roughly `chunk_count / CHUNK_CONCURRENCY * per-call-time`
+  instead of `chunk_count * per-call-time`. Findings are restored to original
+  document order in the output regardless of which chunk's call finished
+  first (`tests/test_parallel_review.py` proves this with reversed completion
+  order, and separately proves the concurrency is real - 3 mocked 0.2s chunks
+  finish in ~0.2s total, not ~0.6s).
+- **Larger chunk budget** (`DEFAULT_CHUNK_CHAR_BUDGET` in `src/pdf_processing.py`,
+  40k → 80k chars): all three allowlisted providers now support ~1M-token
+  context windows, so the old budget was chunking - and round-tripping - far
+  more granularly than needed.
+- **One short retry per chunk** on failure (`_process_one_chunk` in
+  `review_pipeline.py`) before giving up - covers transient/rate-limit blips,
+  which are more likely now that requests go out concurrently.
+- **Explicit request timeout** (`LLM_REQUEST_TIMEOUT_SECONDS`, 150s) on every
+  provider call - previously unset, relying on SDK defaults that can run
+  several minutes, meaning one stuck call could quietly eat most of a job's
+  wall-clock.
+- **Per-chunk timing capture**: every chunk's duration (success or failure)
+  is logged to the debug log, and a "Completed in Xm Ys across N chunks"
+  summary shows on the results screen - so a future "why did this take so
+  long" question comes with real data, not a guess. The progress screen also
+  shows live elapsed time.
+
+**Not built (needs a product decision, not just an engineering fix)**: a
+"fast mode" that trades review depth for speed on very large documents -
+e.g. coarser chunking or skipping low-signal boilerplate sections entirely.
+That changes what the review actually covers, so it's a call for whoever
+owns review quality, not something to decide unilaterally in code.
+
 ## Cost & reliability
 
 - **Prompt caching**: the framework instructions (system prompt) and document
@@ -151,11 +188,16 @@ the current functions are already structured to make that split easy later.
 
 ## Known TODOs before this is "done" rather than "working"
 
-- Tests cover Excel round-trip, JSON-truncation salvage/error behavior, and
-  the caching request payloads (`tests/`) — not yet: `pdf_processing`,
-  `job_store`, or the Streamlit screens themselves (those were smoke-tested
-  manually against a real DP05 report, not under automated test).
-- No automatic retry of a failed chunk — a chunk that fails is skipped and
-  surfaced as a warning; retrying it currently means re-running the review or
-  a Revise Review iteration, not an automatic in-job retry.
-- No rate limiting / abuse protection beyond the shared access code.
+- Tests cover Excel round-trip, JSON-truncation salvage/error behavior,
+  caching request payloads, and chunk concurrency/ordering/retry (`tests/`) —
+  not yet: `pdf_processing`, `job_store`, or the Streamlit screens themselves
+  (those were smoke-tested manually against a real DP05 report, not under
+  automated test).
+- One retry per chunk, not a full retry-with-backoff policy — a chunk that
+  fails twice is skipped and surfaced as a warning; retrying it beyond that
+  means re-running the review or a Revise Review iteration, not further
+  automatic in-job retries.
+- No rate limiting / abuse protection beyond the shared access code — worth
+  revisiting alongside `CHUNK_CONCURRENCY` if this sees real multi-user
+  traffic, since concurrent requests per job now multiply by concurrent
+  users too.

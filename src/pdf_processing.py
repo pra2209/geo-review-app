@@ -21,7 +21,13 @@ class Page:
 
 
 DIGEST_PAGES_PER_FILE = 20
-DEFAULT_CHUNK_CHAR_BUDGET = 40_000  # ~10k tokens, safely inside context for any allowed model
+# ~20k tokens/chunk. Bumped up from an earlier 40_000 (~10k tokens): all three
+# allowlisted providers now support ~1M-token context windows, so the old
+# budget was chunking far more granularly than needed - each extra chunk is a
+# full sequential-or-parallel LLM round trip, so fewer/bigger chunks directly
+# cuts total review latency. See review_pipeline.run_first_pass for the other
+# half of the latency fix (parallelizing the chunk calls).
+DEFAULT_CHUNK_CHAR_BUDGET = 80_000
 
 
 def extract_pages(filename: str, file_bytes: bytes) -> list[Page]:

@@ -11,14 +11,16 @@ may need a fresh full review rather than a cheap iteration. Flagged in the
 README as a v2 improvement (full re-chunk on iteration).
 """
 
+import concurrent.futures
 import json
 import re
+import time
 import traceback
 import uuid
 from dataclasses import dataclass
 from typing import Optional
 
-from src.config import FRAMEWORK_PATH, REVIEW_MAX_TOKENS
+from src.config import CHUNK_CONCURRENCY, FRAMEWORK_PATH, REVIEW_MAX_TOKENS
 from src.llm_client import LLMConfig, call_with_cache
 from src.pdf_processing import Page, render_pages_as_text
 
@@ -122,25 +124,82 @@ def _findings_from_json(items: list[dict]) -> list[Finding]:
     return findings
 
 
+def _process_one_chunk(i: int, total: int, chunk: list[Page], config: LLMConfig,
+                        framework_text: str, cacheable_context: str,
+                        retry_delay_seconds: float = 5.0) -> tuple[list[Finding], Optional[dict], dict]:
+    """Runs one chunk's call (+one short retry on failure) and times it.
+    Returns (findings, error_or_None, timing_dict). Designed to be safe to
+    call from a worker thread - touches no shared mutable state, everything
+    it needs is passed in explicitly."""
+    chunk_text = render_pages_as_text(chunk)
+    dynamic_content = (
+        f"DETAILED SECTION TO REVIEW NOW (chunk {i} of {total}):\n{chunk_text}\n\n"
+        "Review this chunk against all 14 steps that apply to its content, using the digest "
+        "for traceability where needed. Return the JSON findings array now."
+    )
+
+    start = time.perf_counter()
+    last_exc: Optional[Exception] = None
+    raw = None
+    for attempt in (1, 2):
+        try:
+            raw = call_with_cache(config, framework_text, cacheable_context, dynamic_content,
+                                   max_tokens=REVIEW_MAX_TOKENS)
+            items = _extract_json_array(raw)
+            duration = round(time.perf_counter() - start, 1)
+            return (_findings_from_json(items), None,
+                    {"chunk": i, "total": total, "duration_seconds": duration, "attempts": attempt})
+        except Exception as exc:  # noqa: BLE001 - one bad chunk must not sink the job
+            last_exc = exc
+            if attempt == 1:
+                time.sleep(retry_delay_seconds)  # brief pause; likely a transient/rate-limit blip
+
+    duration = round(time.perf_counter() - start, 1)
+    error = {
+        "chunk": i,
+        "total": total,
+        "error": f"Chunk {i} of {total} failed after retry: {last_exc}",
+        "error_type": type(last_exc).__name__,
+        "traceback": traceback.format_exc(),
+        "raw_response": raw,  # full text if the last attempt returned one but parsing failed
+        "duration_seconds": duration,
+    }
+    timing = {"chunk": i, "total": total, "duration_seconds": duration, "attempts": 2, "failed": True}
+    return [], error, timing
+
+
 def run_first_pass(config: LLMConfig, digest_pages: list[Page],
                     chunks: list[list[Page]],
                     extra_instructions: Optional[str] = None,
-                    progress_cb=None) -> tuple[list[Finding], list[dict]]:
-    """One LLM call per chunk. progress_cb(done, total) if provided, for the UI progress bar.
+                    progress_cb=None,
+                    max_workers: int = CHUNK_CONCURRENCY) -> tuple[list[Finding], list[dict], list[dict]]:
+    """Chunks are processed CONCURRENTLY (bounded worker pool - see
+    CHUNK_CONCURRENCY in config.py) rather than one at a time; this is the
+    main lever on review latency, since wall-clock is roughly
+    (chunk_count / max_workers) * per-call-time instead of
+    chunk_count * per-call-time. progress_cb(done, total) fires as each
+    chunk completes (may be out of chunk order - that's fine, it's just a
+    counter). Findings/errors ARE restored to original chunk/document order
+    in the returned lists regardless of completion order, so the final
+    output still reads top-to-bottom sensibly.
 
-    Each chunk's call/parse is isolated: a failure on one chunk (truncated
-    response, transient API error, etc.) does not discard findings already
-    obtained from OTHER chunks that already cost real API spend. Returns
-    (findings, chunk_errors) - chunk_errors is a list of dicts with keys
-    chunk, total, error, error_type, and raw_response (None if the call
-    itself failed before any text came back), empty if everything succeeded.
-    The full dicts are meant for the debug log; callers wanting a short
-    on-screen message should read the "error" key.
+    Each chunk's call/parse is isolated (with one short retry - see
+    _process_one_chunk): a failure on one chunk does not discard findings
+    already obtained from OTHER chunks that already cost real API spend.
+
+    Returns (findings, chunk_errors, chunk_timings). chunk_errors is a list
+    of dicts with keys chunk, total, error, error_type, traceback, and
+    raw_response, empty if everything succeeded - meant for the debug log;
+    callers wanting a short on-screen message should read the "error" key.
+    chunk_timings has one entry per chunk (success or failure) with
+    duration_seconds - meant for the debug log and the results-screen timing
+    summary, so a future "why did this take so long" question has real data
+    instead of a guess.
 
     Cost note: framework_text (system prompt) and cacheable_context (digest)
-    below are byte-identical across every chunk call in this loop - that's
-    exactly what prompt caching needs to kick in on repeat calls after the
-    first. Only the per-chunk dynamic_content varies.
+    below are byte-identical across every chunk call - that's exactly what
+    prompt caching needs to kick in on repeat calls after the first. Only
+    the per-chunk dynamic_content varies.
     """
     framework_text = load_framework()
     if extra_instructions:
@@ -154,36 +213,34 @@ def run_first_pass(config: LLMConfig, digest_pages: list[Page],
         "PROJECT DIGEST (opening pages of each source file, for cross-reference / "
         f"traceability checks only - do not re-review this section on its own):\n{digest_text}"
     )
+    total = len(chunks)
+    results: dict[int, tuple[list[Finding], Optional[dict], dict]] = {}
+    completed = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_index = {
+            executor.submit(_process_one_chunk, i, total, chunk, config,
+                             framework_text, cacheable_context): i
+            for i, chunk in enumerate(chunks, start=1)
+        }
+        for future in concurrent.futures.as_completed(future_to_index):
+            i = future_to_index[future]
+            results[i] = future.result()
+            completed += 1
+            if progress_cb:
+                progress_cb(completed, total)
+
     all_findings: list[Finding] = []
     chunk_errors: list[dict] = []
-    total = len(chunks)
+    chunk_timings: list[dict] = []
+    for i in range(1, total + 1):
+        findings, error, timing = results[i]
+        all_findings.extend(findings)
+        if error:
+            chunk_errors.append(error)
+        chunk_timings.append(timing)
 
-    for i, chunk in enumerate(chunks, start=1):
-        chunk_text = render_pages_as_text(chunk)
-        dynamic_content = (
-            f"DETAILED SECTION TO REVIEW NOW (chunk {i} of {total}):\n{chunk_text}\n\n"
-            "Review this chunk against all 14 steps that apply to its content, using the digest "
-            "for traceability where needed. Return the JSON findings array now."
-        )
-        raw = None
-        try:
-            raw = call_with_cache(config, framework_text, cacheable_context, dynamic_content,
-                                   max_tokens=REVIEW_MAX_TOKENS)
-            items = _extract_json_array(raw)
-            all_findings.extend(_findings_from_json(items))
-        except Exception as exc:  # noqa: BLE001 - one bad chunk must not sink the job
-            chunk_errors.append({
-                "chunk": i,
-                "total": total,
-                "error": f"Chunk {i} of {total} failed: {exc}",
-                "error_type": type(exc).__name__,
-                "traceback": traceback.format_exc(),
-                "raw_response": raw,  # full text if the call returned one but parsing failed
-            })
-        if progress_cb:
-            progress_cb(i, total)
-
-    return all_findings, chunk_errors
+    return all_findings, chunk_errors, chunk_timings
 
 
 def run_iteration(config: LLMConfig, digest_pages: list[Page],

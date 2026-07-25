@@ -2,11 +2,13 @@
 
 from openai import OpenAI
 
+from src.config import LLM_REQUEST_TIMEOUT_SECONDS
+
 
 def call(api_key: str, model: str, system_prompt: str, user_prompt: str,
           max_tokens: int = 8192) -> str:
     """Single-turn call. Returns raw text (caller parses JSON)."""
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
     resp = client.chat.completions.create(
         model=model,
         max_completion_tokens=max_tokens,
@@ -34,8 +36,9 @@ def call_with_cache(api_key: str, model: str, system_prompt: str, cacheable_cont
 
 
 def validate_key(api_key: str, model: str) -> tuple[bool, str]:
+    """Short timeout - this is a quick UI feedback check, not a real review call."""
     try:
-        client = OpenAI(api_key=api_key)
+        client = OpenAI(api_key=api_key, timeout=20.0)
         client.chat.completions.create(
             model=model,
             max_completion_tokens=8,

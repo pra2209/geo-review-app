@@ -44,7 +44,23 @@ DEFAULT_MODEL = {
 # rather than finishing cleanly. See review_pipeline._extract_json_array for the
 # complementary fix: even if truncation still happens, complete findings are
 # salvaged instead of the whole chunk's output being discarded.
-REVIEW_MAX_TOKENS = 16000
+REVIEW_MAX_TOKENS = 20000
+
+# Explicit per-request timeout. Previously unset (SDK defaults, which can run
+# several minutes) - a single stuck/slow call could silently eat most of a
+# job's wall-clock with nothing forcing it to fail into the retry/skip path.
+# 150s is generous for a legitimately long reasoning-heavy response but bounds
+# the worst case.
+LLM_REQUEST_TIMEOUT_SECONDS = 150
+
+# How many chunk calls run concurrently in the first-pass review loop (see
+# review_pipeline.run_first_pass). This is THE main latency lever - wall-clock
+# for the review stage is roughly (chunk_count / CHUNK_CONCURRENCY) * per-call
+# time instead of chunk_count * per-call time. Kept conservative by default
+# since BYOK means we don't know the user's actual provider rate-limit tier;
+# raise it if you're on a higher tier and hitting few/no rate-limit errors in
+# the debug log's chunk_timings.
+CHUNK_CONCURRENCY = 4
 
 # --- Upload limits -----------------------------------------------------------
 MAX_FILES_PER_JOB = 5

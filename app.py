@@ -12,7 +12,7 @@ import traceback
 
 import streamlit as st
 
-from src.config import ALLOWED_MODELS, DEFAULT_MODEL, MAX_FILES_PER_JOB
+from src.config import ALLOWED_MODELS, CHUNK_CONCURRENCY, DEFAULT_MODEL, MAX_FILES_PER_JOB
 from src import job_store
 from src.excel_io import write_excel, read_reviewer_comments, DISCLAIMER
 from src.llm_client import LLMConfig, validate_key
@@ -178,6 +178,7 @@ def _start_summarization_bg(job_id: str, config: LLMConfig):
         try:
             job_store.set_status(job_id, "summarizing", stage="Extracting text and summarizing...",
                                   current=0, total=1)
+            job_store.set_stage_start(job_id)
             files = job_store.get_uploaded_files(job_id)
             pages = extract_all(files)
             digest = build_digest(pages)
@@ -222,6 +223,8 @@ def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, it
     def _run():
         try:
             job_store.set_status(job_id, "reviewing", stage="Starting review...", current=0, total=1)
+            job_store.set_stage_start(job_id)
+            run_start = time.time()
             files = job_store.get_uploaded_files(job_id)
             pages = extract_all(files)
             digest = build_digest(pages)
@@ -232,12 +235,23 @@ def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, it
                                       stage=f"Reviewing section {done} of {total}...",
                                       current=done, total=total)
 
-            findings, chunk_errors = run_first_pass(
+            findings, chunk_errors, chunk_timings = run_first_pass(
                 config, digest, chunks, extra_instructions or None, progress_cb=progress_cb)
+            total_duration = round(time.time() - run_start, 1)
 
             for ce in chunk_errors:
                 job_store.append_debug_event(job_id, {"stage": "reviewing_chunk", **ce,
                                                         "provider": config.provider, "model": config.model})
+            for ct in chunk_timings:
+                job_store.append_debug_event(job_id, {"stage": "chunk_timing", **ct})
+
+            job_store.save_run_stats(job_id, iteration, {
+                "total_duration_seconds": total_duration,
+                "chunk_count": len(chunks),
+                "workers": CHUNK_CONCURRENCY,
+                "chunks_failed": len(chunk_errors),
+                "chunk_durations_seconds": [t["duration_seconds"] for t in chunk_timings],
+            })
 
             if not findings and chunk_errors:
                 # Every chunk failed - nothing to show, this really is fatal.
@@ -266,6 +280,7 @@ def _start_iteration_bg(job_id: str, config: LLMConfig, overarching_comment: str
     def _run():
         try:
             job_store.set_status(job_id, "iterating", stage="Starting revision...", current=0, total=1)
+            job_store.set_stage_start(job_id)
             prior = job_store.get_findings(job_id, next_iteration - 1) or []
             for f in prior:
                 if f.finding_id in reviewer_comments:
@@ -304,12 +319,19 @@ def _start_iteration_bg(job_id: str, config: LLMConfig, overarching_comment: str
 # Screen: progress (polling)
 # ---------------------------------------------------------------------------
 
-def render_progress_screen(status: dict):
+def render_progress_screen(job_id: str, status: dict):
     st.header("Working...")
     total = max(status["progress_total"], 1)
     current = status["progress_current"]
     st.progress(current / total, text=status["progress_stage"] or "Working...")
-    st.caption("This page auto-refreshes every couple of seconds.")
+
+    stage_start = job_store.get_stage_start(job_id)
+    if stage_start:
+        elapsed = int(time.time() - stage_start)
+        st.caption(f"Elapsed: {elapsed // 60}m {elapsed % 60}s — this page auto-refreshes "
+                   "every couple of seconds.")
+    else:
+        st.caption("This page auto-refreshes every couple of seconds.")
     time.sleep(2)
     st.rerun()
 
@@ -330,6 +352,16 @@ def render_results_screen(job_id: str, config: LLMConfig | None, iteration: int,
         _debug_log_download_button(job_id, key="iteration_error_debug_log")
 
     st.header(f"5. Results (iteration {iteration})")
+    run_stats = job_store.get_run_stats(job_id, iteration)
+    if run_stats:
+        total_s = run_stats["total_duration_seconds"]
+        durations = run_stats.get("chunk_durations_seconds") or []
+        slowest = f", slowest chunk {max(durations):.0f}s" if durations else ""
+        st.caption(
+            f"Completed in {int(total_s // 60)}m {int(total_s % 60)}s across "
+            f"{run_stats['chunk_count']} section(s) ({run_stats['workers']} concurrent, "
+            f"{run_stats['chunks_failed']} needed a retry{slowest})."
+        )
     if warnings:
         with st.expander(f"⚠️ {len(warnings)} section(s) had a problem and were skipped "
                           "(findings below are still complete for everything that succeeded)",
@@ -428,7 +460,7 @@ def main():
         return
 
     if status["status"] in ("uploaded", "summarizing"):
-        render_progress_screen(status)
+        render_progress_screen(job_id, status)
         return
 
     if status["status"] == "summarized":
@@ -436,7 +468,7 @@ def main():
         return
 
     if status["status"] in ("reviewing", "iterating"):
-        render_progress_screen(status)
+        render_progress_screen(job_id, status)
         return
 
     if status["status"] in ("review_done", "finished"):

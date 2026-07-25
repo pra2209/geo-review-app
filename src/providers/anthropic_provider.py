@@ -2,11 +2,13 @@
 
 from anthropic import Anthropic
 
+from src.config import LLM_REQUEST_TIMEOUT_SECONDS
+
 
 def call(api_key: str, model: str, system_prompt: str, user_prompt: str,
           max_tokens: int = 8192) -> str:
     """Single-turn call. Returns raw text (caller parses JSON)."""
-    client = Anthropic(api_key=api_key)
+    client = Anthropic(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
     resp = client.messages.create(
         model=model,
         max_tokens=max_tokens,
@@ -29,7 +31,7 @@ def call_with_cache(api_key: str, model: str, system_prompt: str, cacheable_cont
     just won't be cached. Cache entries live ~5 minutes, comfortably longer
     than the few seconds between the chunk calls in one job's first pass.
     """
-    client = Anthropic(api_key=api_key)
+    client = Anthropic(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
     content_blocks = []
     if cacheable_context:
         content_blocks.append({
@@ -53,9 +55,10 @@ def call_with_cache(api_key: str, model: str, system_prompt: str, cacheable_cont
 
 
 def validate_key(api_key: str, model: str) -> tuple[bool, str]:
-    """Cheap round-trip to confirm the key/model combo actually works."""
+    """Cheap round-trip to confirm the key/model combo actually works. Short
+    timeout - this is a quick UI feedback check, not a real review call."""
     try:
-        client = Anthropic(api_key=api_key)
+        client = Anthropic(api_key=api_key, timeout=20.0)
         client.messages.create(
             model=model,
             max_tokens=8,

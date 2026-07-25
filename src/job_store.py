@@ -149,6 +149,38 @@ def get_extra_instructions(job_id: str) -> Optional[str]:
         return f.read()
 
 
+# --- Stage timing (for the "is it stuck?" elapsed-time readout) --------------
+
+def set_stage_start(job_id: str):
+    with open(os.path.join(_job_dir(job_id), "stage_started_at.txt"), "w", encoding="utf-8") as f:
+        f.write(str(time.time()))
+
+
+def get_stage_start(job_id: str) -> Optional[float]:
+    path = os.path.join(_job_dir(job_id), "stage_started_at.txt")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return float(f.read().strip())
+
+
+def save_run_stats(job_id: str, iteration: int, stats: dict):
+    """Small summary of the just-completed run - total duration, chunk count,
+    concurrency used - shown on the results screen and included in the debug
+    log for future latency questions."""
+    path = os.path.join(_job_dir(job_id), f"run_stats_v{iteration}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
+
+
+def get_run_stats(job_id: str, iteration: int) -> Optional[dict]:
+    path = os.path.join(_job_dir(job_id), f"run_stats_v{iteration}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 # --- Findings & Excel per iteration ------------------------------------------
 
 def save_findings(job_id: str, iteration: int, findings: list[Finding]):

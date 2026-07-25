@@ -12,11 +12,13 @@ for the widest compatibility with Google's compat layer.
 
 from openai import OpenAI
 
+from src.config import LLM_REQUEST_TIMEOUT_SECONDS
+
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 
-def _client(api_key: str) -> OpenAI:
-    return OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL)
+def _client(api_key: str, timeout: float = LLM_REQUEST_TIMEOUT_SECONDS) -> OpenAI:
+    return OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL, timeout=timeout)
 
 
 def call(api_key: str, model: str, system_prompt: str, user_prompt: str,
@@ -50,8 +52,9 @@ def call_with_cache(api_key: str, model: str, system_prompt: str, cacheable_cont
 
 
 def validate_key(api_key: str, model: str) -> tuple[bool, str]:
+    """Short timeout - this is a quick UI feedback check, not a real review call."""
     try:
-        client = _client(api_key)
+        client = _client(api_key, timeout=20.0)
         client.chat.completions.create(
             model=model,
             max_tokens=8,
