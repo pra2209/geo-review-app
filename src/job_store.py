@@ -216,6 +216,29 @@ def get_warnings(job_id: str, iteration: int) -> list[str]:
         return json.load(f)
 
 
+# --- Cooperative cancellation --------------------------------------------------
+# Streamlit's own "Stop" only interrupts the current script rerun, not a
+# background thread doing a real network call - it can't reach these at all.
+# This flag is checked between chunk completions in run_first_pass: it stops
+# any NOT-YET-STARTED queued chunk calls from ever running, but calls already
+# in flight (bounded by CHUNK_CONCURRENCY, and now by LLM_REQUEST_TIMEOUT_SECONDS)
+# finish naturally - a raw Python thread can't be safely force-killed mid-call.
+
+def request_cancel(job_id: str):
+    with open(os.path.join(_job_dir(job_id), "cancel_requested.flag"), "w") as f:
+        f.write("1")
+
+
+def is_cancel_requested(job_id: str) -> bool:
+    return os.path.exists(os.path.join(_job_dir(job_id), "cancel_requested.flag"))
+
+
+def clear_cancel(job_id: str):
+    path = os.path.join(_job_dir(job_id), "cancel_requested.flag")
+    if os.path.exists(path):
+        os.remove(path)
+
+
 # --- Debug log ---------------------------------------------------------------
 # Every error/warning event gets appended here (full traceback, raw LLM
 # response where available, which stage/chunk it happened in). Never includes

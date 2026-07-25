@@ -55,10 +55,11 @@ def test_run_first_pass_preserves_chunk_order_despite_reversed_completion():
         return _finding_json("Finding from chunk 3")
 
     with patch("src.review_pipeline.call_with_cache", side_effect=fake_call_with_cache):
-        findings, chunk_errors, chunk_timings = run_first_pass(
+        findings, chunk_errors, chunk_timings, cancelled = run_first_pass(
             FAKE_CONFIG, digest, chunks, progress_cb=None, max_workers=3)
 
     assert chunk_errors == []
+    assert cancelled is False
     assert [f.snapshot for f in findings] == [
         "Finding from chunk 1", "Finding from chunk 2", "Finding from chunk 3",
     ], "findings must be in original document order, not completion order"
@@ -80,7 +81,7 @@ def test_run_first_pass_runs_concurrently_not_sequentially():
 
     with patch("src.review_pipeline.call_with_cache", side_effect=fake_call_with_cache):
         start = time.perf_counter()
-        findings, chunk_errors, chunk_timings = run_first_pass(
+        findings, chunk_errors, chunk_timings, cancelled = run_first_pass(
             FAKE_CONFIG, digest, chunks, progress_cb=None, max_workers=3)
         elapsed = time.perf_counter() - start
 
@@ -128,9 +129,55 @@ def test_process_one_chunk_gives_up_after_two_failures():
     print("test_process_one_chunk_gives_up_after_two_failures: OK")
 
 
+def test_cancellation_stops_not_yet_started_chunks_but_keeps_completed_findings():
+    """8 chunks, only 2 workers, each call takes 0.1s. cancel_check flips to
+    True after the first chunk completes - by then only ~2 chunks have had a
+    chance to start (bounded by max_workers). The rest should never run:
+    findings only from chunks that actually completed, and their errors are
+    marked "Cancelled", not silently dropped."""
+    chunks = [[_page("report.pdf", i, f"content {i}")] for i in range(1, 9)]
+    digest = [_page("report.pdf", 0, "digest")]
+    calls_made = {"count": 0}
+
+    def fake_call_with_cache(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+        calls_made["count"] += 1
+        time.sleep(0.1)
+        return _finding_json("Finding")
+
+    cancel_after_first = {"triggered": False}
+
+    def cancel_check():
+        # Simulate the user clicking Cancel right after the first chunk lands.
+        if cancel_after_first["triggered"]:
+            return True
+        return False
+
+    with patch("src.review_pipeline.call_with_cache", side_effect=fake_call_with_cache):
+        def progress_cb(done, total):
+            if done == 1:
+                cancel_after_first["triggered"] = True
+
+        findings, chunk_errors, chunk_timings, cancelled = run_first_pass(
+            FAKE_CONFIG, digest, chunks, progress_cb=progress_cb, max_workers=2,
+            cancel_check=cancel_check)
+
+    assert cancelled is True
+    # With only 2 workers, at most a small handful of chunks could have started
+    # before cancellation kicked in - nowhere near all 8.
+    assert calls_made["count"] < 8, (
+        f"expected cancellation to prevent most of the 8 chunks from ever starting, "
+        f"but {calls_made['count']} calls were made")
+    assert len(findings) == calls_made["count"], "findings should exist only for chunks that actually ran"
+    cancelled_entries = [e for e in chunk_errors if e["error_type"] == "Cancelled"]
+    assert len(cancelled_entries) > 0, "expected at least one chunk to be recorded as cancelled, not silently dropped"
+    print(f"test_cancellation_stops_not_yet_started_chunks_but_keeps_completed_findings: OK "
+          f"({calls_made['count']}/8 chunks ran before cancel)")
+
+
 if __name__ == "__main__":
     test_run_first_pass_preserves_chunk_order_despite_reversed_completion()
     test_run_first_pass_runs_concurrently_not_sequentially()
     test_process_one_chunk_retries_once_then_succeeds()
     test_process_one_chunk_gives_up_after_two_failures()
+    test_cancellation_stops_not_yet_started_chunks_but_keeps_completed_findings()
     print("All tests passed.")

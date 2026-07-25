@@ -68,6 +68,66 @@ If cost is the main thing stopping your team from adopting this, **Gemini 2.5 Pr
 shared team key** (see below) is the lowest-friction fix — cheaper per call than either
 current default, still clears the reasoning-capability bar the allowlist enforces.
 
+## Incident postmortem: jobs stuck forever at "reviewing"
+
+A real deployed job got permanently stuck, unrecoverable by Streamlit's own
+"Stop" button. Root cause, found from the Streamlit Cloud log (search it for
+`AttributeError` and `Thread-25` if you want the raw evidence):
+
+A background review thread held a **stale reference to the `job_store`
+module** - captured when the thread started, before a hot-reload deployed a
+newer `job_store.py` with a new function (`append_debug_event`) that the
+thread's copy of `app.py` expected to exist. When the thread tried to log a
+chunk error, it hit `AttributeError: module 'src.job_store' has no attribute
+'append_debug_event'`. The outer exception handler then tried to log *that*
+failure through the exact same broken call and got the **identical error
+again**. That double-fault meant execution never reached the
+`job_store.set_status(job_id, "error", ...)` line - the only thing that lets
+the UI ever learn a job died. The job sat at `status="reviewing"` forever,
+not because anything was slow or hung, but because the one thread responsible
+for reporting its own failure crashed before it could report anything.
+Streamlit's Stop button could not help - there was nothing left running to
+stop.
+
+Two fixes, both shipped:
+
+1. **`_log_error()` can now never raise** (`app.py`) - wrapped in its own
+   try/except, so a failure while *logging* an error can never prevent
+   *reporting* it. This is the actual fix; regression test in
+   `tests/test_error_reporting_resilience.py` reproduces the exact
+   `AttributeError` and proves it no longer propagates.
+2. **Cancel / Abandon controls on the progress screen** - since a background
+   thread can die (or a deploy can land) at any point with no way for the
+   browser to know, there's now an explicit way out regardless of cause: a
+   Cancel button (cooperative - stops any not-yet-started chunk calls,
+   verified in `tests/test_parallel_review.py` by measuring that only a
+   bounded few of 8 queued chunks ever run after cancelling) and an Abandon
+   button (immediately clears the stuck job from the browser session so you
+   can start a new one, regardless of what the old background thread is
+   still doing).
+
+**Residual risk, not fully closed**: this class of bug - a long-lived thread
+holding stale references across a hot-reload - can resurface in a different
+shape if a future code change introduces the same pattern elsewhere. The
+`_log_error` fix specifically hardens the one path that made THIS incident
+unrecoverable; it doesn't prevent every possible consequence of deploying new
+code while a background thread from older code is still running. Practical
+mitigation: avoid pushing to `main` while a job might be actively running on
+the deployed app, and if the app ever seems stuck after a fresh deploy, use
+**Manage app → Reboot app** rather than waiting - a full restart clears any
+stale in-memory state that a code push alone does not.
+
+**A second, separate crash signature was also present in that same log**,
+later in the timeline: repeated `KeyError` inside `importlib`'s
+`_find_and_load` / `_load_unlocked`, immediately after a `🔄 Updated app!`
+deploy marker, cascading through a different module on each subsequent
+rerun. This is import-cache corruption from a hot-reload racing Python
+3.14's import system (Streamlit Cloud's runtime version at the time) - not
+the same bug as above, and not something fixable in application code. If you
+see this specific `KeyError`-from-`importlib` signature in the logs: same
+recovery (Reboot app), different cause (platform-level, not the
+`_log_error` issue).
+
 ## Latency
 
 For a large multi-hundred-page PDF, review time was originally dominated by

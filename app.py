@@ -33,19 +33,34 @@ def _log_error(job_id: str, stage: str, exc: Exception, config: LLMConfig | None
     """Captures full diagnostic context for one error into the job's debug
     log - never the API key, never PDF binary content. Intended to be handed
     straight to Claude Code for debugging instead of copy-pasting a truncated
-    on-screen message."""
-    event = {
-        "stage": stage,
-        "error_type": type(exc).__name__,
-        "error_message": str(exc),
-        "traceback": traceback.format_exc(),
-    }
-    if config is not None:
-        event["provider"] = config.provider
-        event["model"] = config.model
-    if extra:
-        event.update(extra)
-    job_store.append_debug_event(job_id, event)
+    on-screen message.
+
+    MUST NEVER RAISE. This runs inside background-thread except blocks,
+    immediately before the job_store.set_status(..., "error", ...) call that
+    is the ONLY thing that lets the UI ever learn the job died - see the
+    incident this comment is a postmortem of: a background thread held a
+    stale reference to job_store (captured before a hot-reload added
+    append_debug_event), so THIS call raised AttributeError, which propagated
+    out uncaught and skipped the status update entirely. The job was then
+    stuck at status="reviewing" forever - not slow, not hung, just never
+    informed anyone it had died. Streamlit's "Stop" button cannot help with
+    that; there was nothing left running to stop.
+    """
+    try:
+        event = {
+            "stage": stage,
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        if config is not None:
+            event["provider"] = config.provider
+            event["model"] = config.model
+        if extra:
+            event.update(extra)
+        job_store.append_debug_event(job_id, event)
+    except Exception:  # noqa: BLE001 - logging the error must never prevent reporting it
+        pass
 
 
 def _debug_log_download_button(job_id: str, key: str):
@@ -222,6 +237,7 @@ def render_summary_screen(job_id: str, config: LLMConfig | None):
 def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, iteration: int):
     def _run():
         try:
+            job_store.clear_cancel(job_id)
             job_store.set_status(job_id, "reviewing", stage="Starting review...", current=0, total=1)
             job_store.set_stage_start(job_id)
             run_start = time.time()
@@ -235,8 +251,9 @@ def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, it
                                       stage=f"Reviewing section {done} of {total}...",
                                       current=done, total=total)
 
-            findings, chunk_errors, chunk_timings = run_first_pass(
-                config, digest, chunks, extra_instructions or None, progress_cb=progress_cb)
+            findings, chunk_errors, chunk_timings, cancelled = run_first_pass(
+                config, digest, chunks, extra_instructions or None, progress_cb=progress_cb,
+                cancel_check=lambda: job_store.is_cancel_requested(job_id))
             total_duration = round(time.time() - run_start, 1)
 
             for ce in chunk_errors:
@@ -251,12 +268,13 @@ def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, it
                 "workers": CHUNK_CONCURRENCY,
                 "chunks_failed": len(chunk_errors),
                 "chunk_durations_seconds": [t["duration_seconds"] for t in chunk_timings],
+                "cancelled": cancelled,
             })
 
-            if not findings and chunk_errors:
-                # Every chunk failed - nothing to show, this really is fatal.
+            if not findings and (chunk_errors or cancelled):
+                status = "cancelled" if cancelled else "error"
                 job_store.set_status(
-                    job_id, "error",
+                    job_id, status,
                     error="All chunks failed:\n" + "\n".join(ce["error"] for ce in chunk_errors))
                 return
 
@@ -265,9 +283,13 @@ def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, it
             excel_bytes = write_excel(findings, job_id)
             job_store.save_excel(job_id, iteration, excel_bytes)
             job_store.set_iteration(job_id, iteration)
-            stage = "Review complete" if not chunk_errors else (
-                f"Review complete with {len(chunk_errors)} section(s) needing a retry - see warnings below")
-            job_store.set_status(job_id, "review_done", stage=stage, current=1, total=1)
+            if cancelled:
+                stage = f"Cancelled - {len(findings)} finding(s) from completed sections kept"
+                job_store.set_status(job_id, "cancelled", stage=stage, current=1, total=1)
+            else:
+                stage = "Review complete" if not chunk_errors else (
+                    f"Review complete with {len(chunk_errors)} section(s) needing a retry - see warnings below")
+                job_store.set_status(job_id, "review_done", stage=stage, current=1, total=1)
         except Exception as exc:  # noqa: BLE001
             _log_error(job_id, "reviewing", exc, config)
             job_store.set_status(job_id, "error", error=str(exc))
@@ -332,6 +354,28 @@ def render_progress_screen(job_id: str, status: dict):
                    "every couple of seconds.")
     else:
         st.caption("This page auto-refreshes every couple of seconds.")
+
+    st.divider()
+    st.caption(
+        "Note: this app's background work runs as a server-side thread, not tied to your "
+        "browser tab - Streamlit's own Stop button can't reach it. Use the controls below "
+        "instead if you want to stop waiting."
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        if status["status"] == "reviewing" and st.button("Cancel this review", key=f"cancel_{job_id}"):
+            job_store.request_cancel(job_id)
+            st.info("Cancelling - sections already in progress will finish, but no new ones "
+                    "will start. This page will update shortly.")
+            time.sleep(2)
+            st.rerun()
+    with col2:
+        if st.button("Abandon and start a new job now", key=f"abandon_{job_id}"):
+            job_store.request_cancel(job_id)  # best-effort - stops queued-but-not-started work
+            st.session_state.pop("job_id", None)
+            st.query_params.clear()
+            st.rerun()
+
     time.sleep(2)
     st.rerun()
 
@@ -475,6 +519,21 @@ def main():
         with st.expander("Project summary", expanded=False):
             st.markdown(job_store.get_summary(job_id))
         render_results_screen(job_id, config, status["iteration"], finished=status["status"] == "finished")
+        return
+
+    if status["status"] == "cancelled":
+        st.warning("You cancelled this review.")
+        if status["iteration"] > 0:
+            st.caption("Findings from sections that completed before you cancelled are kept below.")
+            with st.expander("Project summary", expanded=False):
+                st.markdown(job_store.get_summary(job_id))
+            render_results_screen(job_id, config, status["iteration"], finished=True)
+        else:
+            st.caption("Nothing completed before you cancelled - there's nothing to show or download.")
+            if st.button("Start a new job"):
+                st.session_state.pop("job_id", None)
+                st.query_params.clear()
+                st.rerun()
         return
 
 

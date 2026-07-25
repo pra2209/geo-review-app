@@ -172,7 +172,8 @@ def run_first_pass(config: LLMConfig, digest_pages: list[Page],
                     chunks: list[list[Page]],
                     extra_instructions: Optional[str] = None,
                     progress_cb=None,
-                    max_workers: int = CHUNK_CONCURRENCY) -> tuple[list[Finding], list[dict], list[dict]]:
+                    max_workers: int = CHUNK_CONCURRENCY,
+                    cancel_check=None) -> tuple[list[Finding], list[dict], list[dict], bool]:
     """Chunks are processed CONCURRENTLY (bounded worker pool - see
     CHUNK_CONCURRENCY in config.py) rather than one at a time; this is the
     main lever on review latency, since wall-clock is roughly
@@ -187,14 +188,25 @@ def run_first_pass(config: LLMConfig, digest_pages: list[Page],
     _process_one_chunk): a failure on one chunk does not discard findings
     already obtained from OTHER chunks that already cost real API spend.
 
-    Returns (findings, chunk_errors, chunk_timings). chunk_errors is a list
-    of dicts with keys chunk, total, error, error_type, traceback, and
-    raw_response, empty if everything succeeded - meant for the debug log;
-    callers wanting a short on-screen message should read the "error" key.
-    chunk_timings has one entry per chunk (success or failure) with
-    duration_seconds - meant for the debug log and the results-screen timing
-    summary, so a future "why did this take so long" question has real data
-    instead of a guess.
+    cancel_check: optional no-arg callable returning True once cancellation
+    is requested (deliberately dependency-injected, not imported from
+    job_store here, to avoid a circular import - job_store imports Finding
+    from this module). Checked after each chunk completes; if it returns
+    True, every NOT-YET-STARTED queued chunk future is cancelled so the job
+    stops burning further API spend. Chunks already in flight (at most
+    max_workers of them) can't be safely force-killed mid-request - a raw
+    Python thread has no safe interrupt - so they finish naturally, bounded
+    by LLM_REQUEST_TIMEOUT_SECONDS. Findings from chunks that DID complete
+    before cancellation are still returned, not discarded.
+
+    Returns (findings, chunk_errors, chunk_timings, cancelled). chunk_errors
+    is a list of dicts with keys chunk, total, error, error_type, traceback,
+    and raw_response, empty if everything succeeded - meant for the debug
+    log; callers wanting a short on-screen message should read the "error"
+    key. chunk_timings has one entry per chunk (success, failure, or
+    cancelled) with duration_seconds - meant for the debug log and the
+    results-screen timing summary, so a future "why did this take so long"
+    question has real data instead of a guess.
 
     Cost note: framework_text (system prompt) and cacheable_context (digest)
     below are byte-identical across every chunk call - that's exactly what
@@ -216,6 +228,7 @@ def run_first_pass(config: LLMConfig, digest_pages: list[Page],
     total = len(chunks)
     results: dict[int, tuple[list[Finding], Optional[dict], dict]] = {}
     completed = 0
+    cancelled = False
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_index = {
@@ -225,10 +238,22 @@ def run_first_pass(config: LLMConfig, digest_pages: list[Page],
         }
         for future in concurrent.futures.as_completed(future_to_index):
             i = future_to_index[future]
-            results[i] = future.result()
+            try:
+                results[i] = future.result()
+            except concurrent.futures.CancelledError:
+                results[i] = ([], {
+                    "chunk": i, "total": total,
+                    "error": f"Chunk {i} of {total} cancelled before it started.",
+                    "error_type": "Cancelled", "traceback": "", "raw_response": None,
+                }, {"chunk": i, "total": total, "duration_seconds": 0, "attempts": 0, "cancelled": True})
             completed += 1
             if progress_cb:
                 progress_cb(completed, total)
+
+            if not cancelled and cancel_check and cancel_check():
+                cancelled = True
+                for pending_future in future_to_index:
+                    pending_future.cancel()  # no-op (returns False) for ones already running
 
     all_findings: list[Finding] = []
     chunk_errors: list[dict] = []
@@ -240,7 +265,7 @@ def run_first_pass(config: LLMConfig, digest_pages: list[Page],
             chunk_errors.append(error)
         chunk_timings.append(timing)
 
-    return all_findings, chunk_errors, chunk_timings
+    return all_findings, chunk_errors, chunk_timings, cancelled
 
 
 def run_iteration(config: LLMConfig, digest_pages: list[Page],
