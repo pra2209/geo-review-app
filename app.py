@@ -37,7 +37,9 @@ def render_password_gate() -> bool:
     st.title("Geotechnical Report Review")
     code = st.text_input("Access code", type="password")
     if st.button("Enter"):
-        expected = st.secrets.get("ACCESS_CODE")
+        # Falls back to a hardcoded default if Secrets isn't configured on the
+        # deploy target yet - Secrets, when set, still takes precedence.
+        expected = st.secrets.get("ACCESS_CODE", "richa@123")
         if expected and code == expected:
             st.session_state["authenticated"] = True
             st.rerun()
