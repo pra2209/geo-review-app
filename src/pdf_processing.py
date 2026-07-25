@@ -12,6 +12,23 @@ from dataclasses import dataclass
 
 import fitz  # PyMuPDF
 
+# Silences MuPDF's native (C-level) stderr output - things like "MuPDF error:
+# format error: cannot find object in xref (N 0 R)". These come from PyMuPDF's
+# internal repair/recovery pass on a PDF with malformed cross-reference table
+# entries (common in reports assembled/re-saved from multiple sources - scans,
+# CAD exports, merged appendices). They are USUALLY recoverable: extraction
+# still succeeds via fallback parsing, one warning per resolution attempt, and
+# a single malformed object can be referenced hundreds of times across a large
+# document, producing thousands of near-identical log lines that look alarming
+# but are not themselves the cause of a stuck/failed job (confirmed against a
+# real incident log - the actual failure that day was unrelated, see README
+# "Incident postmortem"). Silenced here so they stop causing false-alarm
+# confusion in the Cloud logs; get_and_clear_extraction_warnings() below still
+# captures a one-line summary so genuine signal (a badly corrupted PDF) isn't
+# lost outright.
+fitz.TOOLS.mupdf_display_errors(False)
+fitz.TOOLS.mupdf_display_warnings(False)
+
 
 @dataclass
 class Page:
@@ -42,10 +59,21 @@ def extract_pages(filename: str, file_bytes: bytes) -> list[Page]:
 
 def extract_all(files: list[tuple[str, bytes]]) -> list[Page]:
     """files: list of (filename, bytes). Returns combined, order-preserved page list."""
+    fitz.TOOLS.reset_mupdf_warnings()
     all_pages: list[Page] = []
     for filename, file_bytes in files:
         all_pages.extend(extract_pages(filename, file_bytes))
     return all_pages
+
+
+def get_and_clear_extraction_warnings() -> list[str]:
+    """Call after extract_all() to see whether the source PDF(s) had any
+    recoverable structural issues (malformed xref entries etc.) - useful as a
+    one-line debug-log summary ("this PDF may be worth re-exporting from its
+    original source") without dumping the raw, often-thousands-of-lines
+    native warning stream anywhere."""
+    warnings = fitz.TOOLS.mupdf_warnings(reset=True)
+    return warnings.splitlines() if warnings else []
 
 
 def build_digest(pages: list[Page], pages_per_file: int = DIGEST_PAGES_PER_FILE) -> list[Page]:

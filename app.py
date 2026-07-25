@@ -16,7 +16,7 @@ from src.config import ALLOWED_MODELS, CHUNK_CONCURRENCY, DEFAULT_MODEL, MAX_FIL
 from src import job_store
 from src.excel_io import write_excel, read_reviewer_comments, DISCLAIMER
 from src.llm_client import LLMConfig, validate_key
-from src.pdf_processing import extract_all, build_digest, chunk_pages
+from src.pdf_processing import extract_all, build_digest, chunk_pages, get_and_clear_extraction_warnings
 from src.review_pipeline import load_framework, run_first_pass, run_iteration, Finding
 from src.summary import generate_summary
 
@@ -60,6 +60,26 @@ def _log_error(job_id: str, stage: str, exc: Exception, config: LLMConfig | None
             event.update(extra)
         job_store.append_debug_event(job_id, event)
     except Exception:  # noqa: BLE001 - logging the error must never prevent reporting it
+        pass
+
+
+def _log_extraction_warnings(job_id: str, stage: str):
+    """Call right after extract_all(). PyMuPDF's native per-occurrence xref
+    warnings are silenced (see pdf_processing.py) - this captures a one-line
+    summary instead, so a genuinely corrupted source PDF is still visible in
+    the debug log without thousands of raw lines cluttering it."""
+    try:
+        warnings = get_and_clear_extraction_warnings()
+        if warnings:
+            job_store.append_debug_event(job_id, {
+                "stage": f"{stage}_pdf_extraction_warnings",
+                "warning_count": len(warnings),
+                "sample": warnings[:5],
+                "note": "Recoverable PDF structural issues (e.g. malformed xref entries) - "
+                        "extraction likely still succeeded via fallback parsing, but the "
+                        "source PDF may be worth re-exporting from its original source.",
+            })
+    except Exception:  # noqa: BLE001 - never let this block the actual pipeline
         pass
 
 
@@ -196,6 +216,7 @@ def _start_summarization_bg(job_id: str, config: LLMConfig):
             job_store.set_stage_start(job_id)
             files = job_store.get_uploaded_files(job_id)
             pages = extract_all(files)
+            _log_extraction_warnings(job_id, "summarizing")
             digest = build_digest(pages)
             summary = generate_summary(config, digest)
             job_store.save_summary(job_id, summary)
@@ -243,6 +264,7 @@ def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, it
             run_start = time.time()
             files = job_store.get_uploaded_files(job_id)
             pages = extract_all(files)
+            _log_extraction_warnings(job_id, "reviewing")
             digest = build_digest(pages)
             chunks = chunk_pages(pages)
 
@@ -310,6 +332,7 @@ def _start_iteration_bg(job_id: str, config: LLMConfig, overarching_comment: str
 
             files = job_store.get_uploaded_files(job_id)
             pages = extract_all(files)
+            _log_extraction_warnings(job_id, "iterating")
             digest = build_digest(pages)
 
             def progress_cb(done, total):

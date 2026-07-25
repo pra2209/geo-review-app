@@ -143,6 +143,22 @@ lifetime. Regression test in `tests/test_job_store_fresh_db.py` reproduces a
 never-before-seen database and confirms `job_exists()` returns `False`
 instead of raising.
 
+**A fourth item, not a bug but a recurring false alarm**: `MuPDF error:
+format error: cannot find object in xref (N 0 R)` showed up in the logs
+multiple times and got mistaken for the cause of the real bugs above each
+time - it's a separate, usually benign PyMuPDF warning from its internal
+repair pass on a PDF with a malformed cross-reference entry (common in
+reports assembled/re-saved from multiple sources). A single malformed object
+can be referenced hundreds of times across a large document, so one warning
+becomes thousands of near-identical log lines. Silenced at the source
+(`fitz.TOOLS.mupdf_display_errors/mupdf_display_warnings(False)` in
+`src/pdf_processing.py`) so it stops causing false alarms, but not thrown
+away outright: `get_and_clear_extraction_warnings()` still captures a
+one-line summary into the debug log (count + a few samples), so a genuinely
+badly-corrupted source PDF remains visible - just as one line, not a log
+flood. Tested against both a deliberately malformed PDF and a well-formed
+one in `tests/test_pdf_extraction_warnings.py`.
+
 ## Latency
 
 For a large multi-hundred-page PDF, review time was originally dominated by
