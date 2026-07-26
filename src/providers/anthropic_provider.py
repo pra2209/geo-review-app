@@ -15,7 +15,7 @@ def call(api_key: str, model: str, system_prompt: str, user_prompt: str,
     whose content required a large synthesized response) traced directly to
     this NOT being the case previously.
     """
-    client = Anthropic(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
+    client = Anthropic(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS, max_retries=0)
     with client.messages.stream(
         model=model,
         max_tokens=max_tokens,
@@ -51,7 +51,7 @@ def call_with_cache(api_key: str, model: str, system_prompt: str, cacheable_cont
     what it always should have: "no data for this long = give up", not
     "the whole multi-minute generation must finish inside this window".
     """
-    client = Anthropic(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
+    client = Anthropic(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS, max_retries=0)
     content_blocks = []
     if cacheable_context:
         content_blocks.append({
@@ -76,7 +76,7 @@ def validate_key(api_key: str, model: str) -> tuple[bool, str]:
     """Cheap round-trip to confirm the key/model combo actually works. Short
     timeout - this is a quick UI feedback check, not a real review call."""
     try:
-        client = Anthropic(api_key=api_key, timeout=20.0)
+        client = Anthropic(api_key=api_key, timeout=20.0, max_retries=0)
         client.messages.create(
             model=model,
             max_tokens=8,

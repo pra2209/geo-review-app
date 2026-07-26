@@ -16,9 +16,15 @@ from src.config import ALLOWED_MODELS, CHUNK_CONCURRENCY, DEFAULT_MODEL, MAX_FIL
 from src import job_store
 from src.excel_io import write_excel, read_reviewer_comments, DISCLAIMER
 from src.llm_client import LLMConfig, validate_key
-from src.pdf_processing import (extract_all, build_digest, chunk_pages,
-                                 get_and_clear_extraction_warnings, compute_text_coverage,
-                                 MIN_MEANINGFUL_CHARS_PER_PAGE)
+from src.pdf_processing import (
+    MIN_MEANINGFUL_CHARS_PER_PAGE,
+    build_digest,
+    chunk_pages,
+    compute_text_coverage,
+    extract_all,
+    get_and_clear_extraction_warnings,
+    render_pages_as_text,
+)
 from src.review_pipeline import load_framework, run_first_pass, run_iteration, Finding
 from src.summary import generate_summary
 
@@ -310,6 +316,18 @@ def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, it
             _log_extraction_warnings(job_id, "reviewing")
             digest = build_digest(pages)
             chunks = chunk_pages(pages)
+            # Record the actual bounded request plan. This contains no API key
+            # or PDF binary, but filenames are retained for source traceability.
+            job_store.append_debug_event(job_id, {
+                "stage": "review_plan",
+                "source_files": list(dict.fromkeys(page.source_file for page in pages)),
+                "extracted_pages": len(pages),
+                "digest_fragments": len(digest),
+                "digest_chars": len(render_pages_as_text(digest)),
+                "chunk_count": len(chunks),
+                "chunk_chars": [len(render_pages_as_text(chunk)) for chunk in chunks],
+                "chunk_fragments": [len(chunk) for chunk in chunks],
+            })
 
             def progress_cb(done, total):
                 job_store.set_status(job_id, "reviewing",
@@ -333,6 +351,8 @@ def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, it
                 "workers": CHUNK_CONCURRENCY,
                 "chunks_failed": len(chunk_errors),
                 "chunk_durations_seconds": [t["duration_seconds"] for t in chunk_timings],
+                "llm_request_count": sum(t.get("attempts", 0) for t in chunk_timings),
+                "adaptive_splits": sum(t.get("adaptive_splits", 0) for t in chunk_timings),
                 "cancelled": cancelled,
             })
 

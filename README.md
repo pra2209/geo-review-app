@@ -214,22 +214,29 @@ with no explicit request timeout. Fixed via:
   first (`tests/test_parallel_review.py` proves this with reversed completion
   order, and separately proves the concurrency is real - 3 mocked 0.2s chunks
   finish in ~0.2s total, not ~0.6s).
-- **Larger chunk budget** (`DEFAULT_CHUNK_CHAR_BUDGET` in `src/pdf_processing.py`,
-  40k → 80k chars): all three allowlisted providers now support ~1M-token
-  context windows, so the old budget was chunking - and round-tripping - far
-  more granularly than needed.
-- **One short retry per chunk** on failure (`_process_one_chunk` in
-  `review_pipeline.py`) before giving up - covers transient/rate-limit blips,
-  which are more likely now that requests go out concurrently.
+- **Bounded request planning** (`src/pdf_processing.py`): detailed review
+  chunks are capped at 45k rendered characters and 12 page fragments, never
+  cross source-file boundaries, and split a single text-dense PDF page
+  losslessly instead of letting it bypass the budget. The repeated project
+  digest is independently capped at 30k rendered characters across all files;
+  previously `20 pages/file` could silently add up to 100 repeated pages on
+  every request.
+- **Adaptive recovery** (`_process_one_chunk` in `review_pipeline.py`):
+  timeout, request-size, and truncated-output failures recursively bisect the
+  input and review smaller child sections instead of repeating the identical
+  request. Depth and provider-call count are bounded, and successful sibling
+  findings are kept if another child ultimately fails.
+- **Single retry owner**: automatic SDK retries are disabled so the app's
+  split/retry policy cannot be invisibly multiplied by provider-library
+  retries.
 - **Explicit request timeout** (`LLM_REQUEST_TIMEOUT_SECONDS`, 150s) on every
   provider call - previously unset, relying on SDK defaults that can run
   several minutes, meaning one stuck call could quietly eat most of a job's
   wall-clock.
-- **Per-chunk timing capture**: every chunk's duration (success or failure)
-  is logged to the debug log, and a "Completed in Xm Ys across N chunks"
-  summary shows on the results screen - so a future "why did this take so
-  long" question comes with real data, not a guess. The progress screen also
-  shows live elapsed time.
+- **Request-plan and timing capture**: the debug log records digest size,
+  per-chunk rendered size/page-fragment count, request count, adaptive split
+  count, and duration. The results screen still shows the total elapsed time,
+  so a future latency failure can be diagnosed from the real request shape.
 
 **Not built (needs a product decision, not just an engineering fix)**: a
 "fast mode" that trades review depth for speed on very large documents -
@@ -320,15 +327,16 @@ the current functions are already structured to make that split easy later.
 
 ## Known TODOs before this is "done" rather than "working"
 
-- Tests cover Excel round-trip, JSON-truncation salvage/error behavior,
-  caching request payloads, and chunk concurrency/ordering/retry (`tests/`) —
-  not yet: `pdf_processing`, `job_store`, or the Streamlit screens themselves
-  (those were smoke-tested manually against a real DP05 report, not under
-  automated test).
-- One retry per chunk, not a full retry-with-backoff policy — a chunk that
-  fails twice is skipped and surfaced as a warning; retrying it beyond that
-  means re-running the review or a Revise Review iteration, not further
-  automatic in-job retries.
+- Tests cover Excel round-trip/injection defense, JSON truncation,
+  provider streaming/prompt shape, parallel ordering, bounded/lossless PDF
+  chunking, multi-file digest limits, recursive timeout splitting, partial
+  child recovery, scanned-page detection, and fresh-database startup. The
+  Streamlit screens themselves still require a real browser smoke test after
+  UI changes.
+- Chunk planning is deliberately provider-neutral and character-based rather
+  than exact-token-based. The independent 30k digest and 45k detailed limits
+  keep requests predictable across all three providers; provider token-count
+  telemetry remains a useful future enhancement.
 - No rate limiting / abuse protection beyond the shared access code — worth
   revisiting alongside `CHUNK_CONCURRENCY` if this sees real multi-user
   traffic, since concurrent requests per job now multiply by concurrent

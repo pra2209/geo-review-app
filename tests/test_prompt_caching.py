@@ -51,6 +51,8 @@ def test_anthropic_call_with_cache_marks_system_and_context_as_ephemeral():
             max_tokens=1234,
         )
 
+        assert MockClient.call_args.kwargs["max_retries"] == 0, \
+            "application retry logic must be the only retry owner"
         call_kwargs = instance.messages.stream.call_args.kwargs
 
         # System prompt must be a cache-marked content block, not a plain string,
@@ -114,6 +116,8 @@ def test_openai_call_with_cache_preserves_prefix_order():
             dynamic_content="CHUNK 1",
         )
 
+        assert MockClient.call_args.kwargs["max_retries"] == 0, \
+            "application retry logic must be the only retry owner"
         call_kwargs = instance.chat.completions.create.call_args.kwargs
         assert call_kwargs["stream"] is True, "must request a streaming response"
         user_message = call_kwargs["messages"][1]["content"]
@@ -133,6 +137,7 @@ def test_gemini_uses_google_endpoint_not_openais():
         gemini_provider.call(api_key="fake-gemini-key", model="gemini-2.5-pro",
                               system_prompt="sys", user_prompt="usr")
         _, kwargs = MockClient.call_args
+        assert kwargs["max_retries"] == 0
         assert kwargs["base_url"] == gemini_provider.GEMINI_BASE_URL
         assert "openai.com" not in kwargs["base_url"]
         print("test_gemini_uses_google_endpoint_not_openais: OK")
