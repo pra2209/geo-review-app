@@ -87,7 +87,7 @@ def test_timeout_on_large_chunk_splits_instead_of_repeating_same_payload():
     class APITimeoutError(RuntimeError):
         pass
 
-    def fake_call(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+    def fake_call(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192, response_mode="balanced"):
         calls.append((dynamic_content, max_tokens))
         if len(calls) == 1:
             raise APITimeoutError("Request timed out or interrupted")
@@ -115,7 +115,7 @@ def test_second_level_timeout_is_recursively_split_with_bounded_calls():
     class APITimeoutError(RuntimeError):
         pass
 
-    def fake_call(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+    def fake_call(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192, response_mode="balanced"):
         calls.append(dynamic_content)
         # Root and its left child time out. The left child must split again;
         # the other leaves succeed.
@@ -140,7 +140,7 @@ def test_small_unsplittable_timeout_retries_with_reduced_output_budget():
     class APITimeoutError(RuntimeError):
         pass
 
-    def fake_call(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+    def fake_call(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192, response_mode="balanced"):
         max_tokens_seen.append(max_tokens)
         if len(max_tokens_seen) == 1:
             raise APITimeoutError("timeout")
@@ -169,7 +169,7 @@ def test_partial_child_failure_keeps_successful_sibling_findings_and_warns():
 
     calls = {"count": 0}
 
-    def fake_call(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+    def fake_call(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192, response_mode="balanced"):
         calls["count"] += 1
         if calls["count"] == 1:
             raise APITimeoutError("timeout")
@@ -211,3 +211,63 @@ def test_randomized_chunking_is_lossless_bounded_and_source_isolated():
         for source, expected in originals.items():
             actual = "".join(page.text for chunk in chunks for page in chunk if page.source_file == source)
             assert actual == expected
+
+
+def test_thinking_only_large_chunk_uses_direct_retry_before_splitting():
+    chunk = [Page("report.pdf", 13, "A" * 5_000), Page("report.pdf", 14, "B" * 5_000)]
+    calls = []
+
+    class NoTextResponseError(RuntimeError):
+        pass
+
+    def fake_call(config, system_prompt, cacheable_context, dynamic_content,
+                  max_tokens=8192, response_mode="balanced"):
+        calls.append((dynamic_content, max_tokens, response_mode))
+        if len(calls) == 1:
+            raise NoTextResponseError(
+                "Anthropic returned no text content block; only thinking content block"
+            )
+        return _finding("direct-recovery")
+
+    with patch("src.review_pipeline.call_with_cache", side_effect=fake_call):
+        findings, error, timing = _process_one_chunk(
+            2, 3, chunk, FAKE_CONFIG, "framework", "digest", retry_delay_seconds=0,
+        )
+
+    assert error is None
+    assert [finding.snapshot for finding in findings] == ["direct-recovery"]
+    assert timing["adaptive_splits"] == 0
+    assert calls == [
+        (calls[0][0], REVIEW_MAX_TOKENS, "balanced"),
+        (calls[0][0], REVIEW_MAX_TOKENS, "direct"),
+    ]
+
+
+def test_unsplittable_thinking_only_retry_switches_to_direct_output_mode():
+    calls = []
+
+    class NoTextResponseError(RuntimeError):
+        pass
+
+    def fake_call(config, system_prompt, cacheable_context, dynamic_content,
+                  max_tokens=8192, response_mode="balanced"):
+        calls.append((max_tokens, response_mode))
+        if len(calls) == 1:
+            raise NoTextResponseError(
+                "Anthropic returned no text content block; only thinking content block"
+            )
+        return _finding("direct-recovery")
+
+    with patch("src.review_pipeline.call_with_cache", side_effect=fake_call):
+        findings, error, timing = _process_one_chunk(
+            1, 1, [Page("report.pdf", 27, "short text")], FAKE_CONFIG,
+            "framework", "digest", retry_delay_seconds=0,
+        )
+
+    assert error is None
+    assert [finding.snapshot for finding in findings] == ["direct-recovery"]
+    assert calls == [
+        (REVIEW_MAX_TOKENS, "balanced"),
+        (REVIEW_MAX_TOKENS, "direct"),
+    ]
+    assert timing["attempts"] == 2

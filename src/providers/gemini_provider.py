@@ -22,7 +22,7 @@ def _client(api_key: str, timeout: float = LLM_REQUEST_TIMEOUT_SECONDS) -> OpenA
 
 
 def call(api_key: str, model: str, system_prompt: str, user_prompt: str,
-          max_tokens: int = 8192) -> str:
+          max_tokens: int = 8192, response_mode: str = "balanced") -> str:
     """Single-turn call. Returns raw text (caller parses JSON).
 
     STREAMING, not a single blocking create() call - see anthropic_provider.py
@@ -49,7 +49,7 @@ def call(api_key: str, model: str, system_prompt: str, user_prompt: str,
 
 
 def call_with_cache(api_key: str, model: str, system_prompt: str, cacheable_context: str,
-                     dynamic_content: str, max_tokens: int = 8192) -> str:
+                     dynamic_content: str, max_tokens: int = 8192, response_mode: str = "balanced") -> str:
     """Same interface as the other providers' call_with_cache(). Gemini 2.5+
     models apply caching automatically server-side for repeated prefixes
     (like OpenAI), so - same as the OpenAI provider - our job is just to keep
@@ -60,7 +60,7 @@ def call_with_cache(api_key: str, model: str, system_prompt: str, cacheable_cont
     worth revisiting if automatic caching doesn't hit reliably in practice.
     """
     user_content = f"{cacheable_context}\n\n{dynamic_content}" if cacheable_context else dynamic_content
-    return call(api_key, model, system_prompt, user_content, max_tokens)
+    return call(api_key, model, system_prompt, user_content, max_tokens, response_mode=response_mode)
 
 
 def validate_key(api_key: str, model: str) -> tuple[bool, str]:

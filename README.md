@@ -193,12 +193,31 @@ several minutes to produce a large, thorough finding set.
 instead of the old blocking one (same assertions - cache_control placement,
 base_url, prefix ordering - just against the new interface).
 `tests/test_streaming_accumulation.py` is new and tests the hand-written
-delta-accumulation logic specifically (Anthropic delegates accumulation to
-the SDK's `get_final_text()`, which doesn't need re-testing here; the
-OpenAI/Gemini manual chunk-joining loop is code we wrote and could get
-wrong - multiple chunks in order, and chunks with no delta content at all,
-which real streams send constantly for role-only/finish-reason-only
-frames).
+delta-accumulation logic specifically for OpenAI/Gemini: multiple deltas in
+order and frames with no text content at all.
+
+**A sixth incident, specific to Claude Sonnet 5 adaptive thinking**: a
+27-page report was planned as pages 1-12, 13-24, and 25-27. Pages 13-24
+ultimately produced no usable findings, while pages 25-27 produced only five
+complete findings before the JSON ended. The provider did not time out: it
+returned successful messages containing only `thinking` blocks, and the old
+wrapper called `get_final_text()`, which raises when no `text` block exists.
+The underlying problem was output-budget starvation: Sonnet 5 enables
+adaptive thinking by default, and thinking plus visible JSON share
+`max_tokens`. The old recovery then halved that budget after splitting,
+which made a visible answer still less likely.
+
+Fixed by reading the final Anthropic Message directly (preserving block types,
+`stop_reason`, and usage), setting explicit medium effort, using strict JSON
+structured output for review calls, and retrying a thinking-only response once
+with thinking disabled before splitting. Truncated/partial-output splits keep
+the full JSON budget; pure timeouts may still lower it. The app now persists a
+page-level coverage manifest and shows exact complete, partial, and unreviewed
+PDF ranges plus best-effort section headings and any locator recovered from an
+unfinished finding. A result with gaps cannot be marked finished without an
+explicit user acknowledgement. Regression coverage is in
+`tests/test_chunking_resilience.py`, `tests/test_prompt_caching.py`, and
+`tests/test_review_coverage.py`.
 
 ## Latency
 
@@ -256,13 +275,14 @@ owns review quality, not something to decide unilaterally in code.
   `tests/test_prompt_caching.py` (can't verify an actual cache *hit* without
   a live key — that shows up in the provider's usage dashboard as
   `cache_read_input_tokens` / cached-token counts on the 2nd+ call).
-- **Per-chunk resilience**: if one chunk's response gets cut off (hit the
-  token limit) or otherwise fails to parse, that chunk's findings are
-  skipped — every other chunk's findings (already paid for) are kept, not
-  discarded. Partial results are surfaced as dismissable warnings on the
-  results screen, not a job-killing error. Same principle applies to a failed
-  "Revise Review" iteration: it falls back to your last successful result
-  instead of a dead-end error screen.
+- **Per-chunk resilience and transparent coverage**: timeout, thinking-only,
+  request-size, and truncated-output failures are recovered with bounded
+  direct retries and/or smaller page ranges. Findings from successful siblings
+  are kept. Any remaining gap is persisted as a coverage manifest and shown as
+  exact complete, partial, or unreviewed PDF page ranges; it is not hidden
+  behind a generic chunk warning. Same principle applies to a failed "Revise
+  Review" iteration: it falls back to the last successful result instead of a
+  dead-end error screen.
 - **Debug log**: any error or per-chunk warning gets a "Download error log"
   button next to it — a JSON bundle with full traceback, the raw model
   response where available, and provider/model (never your API key or PDF

@@ -14,6 +14,7 @@ Two different bounded views are produced:
 """
 
 from dataclasses import dataclass
+import re
 
 import fitz  # PyMuPDF
 
@@ -262,6 +263,78 @@ def chunk_pages(
         chunks.append(current)
     return chunks
 
+
+
+def compress_page_numbers(page_numbers: list[int]) -> str:
+    """Return compact human-readable PDF page ranges (e.g. ``1-3, 5, 8-10``)."""
+    numbers = sorted(set(page_numbers))
+    if not numbers:
+        return ""
+    ranges: list[str] = []
+    start = previous = numbers[0]
+    for number in numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = number
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ", ".join(ranges)
+
+
+_SECTION_HEADING_RE = re.compile(
+    r"(?m)^\s*(\d+(?:\.\d+){1,4})\s*[-–—:.]?\s+([^\n]{3,120})\s*$"
+)
+
+
+def describe_pages(pages: list[Page], max_section_hints: int = 6) -> dict:
+    """Describe a review unit in source-document terms for logs and UI coverage.
+
+    Section headings are best-effort hints extracted from selectable PDF text; page
+    numbers remain the authoritative locator when headings cannot be detected.
+    """
+    if not pages:
+        return {
+            "source_file": "",
+            "page_numbers": [],
+            "page_label": "",
+            "page_start": None,
+            "page_end": None,
+            "fragment_count": 0,
+            "section_hints": [],
+        }
+
+    source_files = list(dict.fromkeys(page.source_file for page in pages))
+    page_numbers = sorted(set(page.page_num for page in pages))
+    hints: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for page in pages:
+        for match in _SECTION_HEADING_RE.finditer(page.text):
+            section_no = match.group(1).strip()
+            title = " ".join(match.group(2).split()).strip(" -–—:.")
+            key = (section_no, title.casefold())
+            if not title or key in seen:
+                continue
+            seen.add(key)
+            hints.append({
+                "section_no": section_no,
+                "title": title[:120],
+                "page": page.page_num,
+            })
+            if len(hints) >= max_section_hints:
+                break
+        if len(hints) >= max_section_hints:
+            break
+
+    return {
+        "source_file": source_files[0] if len(source_files) == 1 else ", ".join(source_files),
+        "page_numbers": page_numbers,
+        "page_label": compress_page_numbers(page_numbers),
+        "page_start": page_numbers[0],
+        "page_end": page_numbers[-1],
+        "fragment_count": len(pages),
+        "section_hints": hints,
+    }
 
 def render_pages_as_text(pages: list[Page]) -> str:
     """Flatten pages/fragments into a tagged prompt block."""

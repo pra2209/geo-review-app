@@ -1,61 +1,147 @@
-"""Thin wrapper around the Anthropic API for the review pipeline."""
+"""Thin wrapper around the Anthropic API for the review pipeline.
+
+Claude Sonnet 5 enables adaptive thinking by default. Thinking and visible text
+share ``max_tokens``, so a structured-output workload can otherwise consume the
+entire response budget before emitting its JSON answer. This wrapper sets an
+explicit balanced effort for normal review calls and supports a direct-output
+fallback used by the adaptive recovery path.
+"""
 
 from anthropic import Anthropic
 
 from src.config import LLM_REQUEST_TIMEOUT_SECONDS
 
 
-def call(api_key: str, model: str, system_prompt: str, user_prompt: str,
-          max_tokens: int = 8192) -> str:
-    """Single-turn call. Returns raw text (caller parses JSON).
+class NoTextResponseError(RuntimeError):
+    """Anthropic completed a request without returning user-visible text."""
 
-    STREAMING, not a single blocking create() call - see the module-level
-    note in call_with_cache() below for why this matters; a real production
-    failure (908s duration against a 150s configured timeout, on a chunk
-    whose content required a large synthesized response) traced directly to
-    this NOT being the case previously.
+
+_ADAPTIVE_THINKING_MODELS = {
+    "claude-sonnet-5",
+    "claude-opus-5",
+}
+
+_FINDINGS_JSON_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "source_file": {"type": "string"},
+            "page_or_item": {"type": "string"},
+            "section_no": {"type": "string"},
+            "snapshot": {"type": "string"},
+            "discipline": {"type": "string"},
+            "review_comment": {"type": "string"},
+            "status": {"type": "string", "enum": ["A", "B", "C", "D", "E"]},
+            "framework_step": {"type": "integer"},
+        },
+        "required": [
+            "source_file", "page_or_item", "section_no", "snapshot",
+            "discipline", "review_comment", "status", "framework_step",
+        ],
+        "additionalProperties": False,
+    },
+}
+
+
+def _thinking_controls(model: str, response_mode: str) -> dict:
+    """Return model-compatible thinking controls for one request."""
+    if model not in _ADAPTIVE_THINKING_MODELS:
+        return {}
+    if response_mode == "direct":
+        return {
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "medium"},
+        }
+    if response_mode != "balanced":
+        raise ValueError(f"Unknown Anthropic response_mode: {response_mode}")
+    return {
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "medium"},
+    }
+
+
+def _review_output_controls(model: str, response_mode: str) -> dict:
+    """Combine thinking controls with a strict findings-array JSON schema."""
+    controls = _thinking_controls(model, response_mode)
+    output_config = dict(controls.get("output_config") or {})
+    output_config["format"] = {
+        "type": "json_schema",
+        "schema": _FINDINGS_JSON_SCHEMA,
+    }
+    return {**controls, "output_config": output_config}
+
+
+def _get_final_text_with_metadata(stream) -> str:
+    """Return all text blocks or raise an actionable no-text response error.
+
+    ``get_final_text()`` raises a generic RuntimeError when Claude returns only
+    thinking blocks. Reading the final Message first preserves ``stop_reason``,
+    content-block types and token usage, which are essential for deciding
+    whether to split/retry and for explaining the gap to the user.
     """
-    client = Anthropic(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS, max_retries=0)
+    message = stream.get_final_message()
+    text = "".join(
+        block.text
+        for block in message.content
+        if getattr(block, "type", None) == "text" and getattr(block, "text", None)
+    )
+    if text:
+        return text
+
+    block_types = [
+        getattr(block, "type", type(block).__name__)
+        for block in message.content
+    ]
+    stop_reason = getattr(message, "stop_reason", None)
+    usage = getattr(message, "usage", None)
+    output_tokens = getattr(usage, "output_tokens", None) if usage is not None else None
+    raise NoTextResponseError(
+        "Anthropic returned no text content block "
+        f"(content_blocks={block_types or ['none']}, stop_reason={stop_reason!r}, "
+        f"output_tokens={output_tokens!r}). The generated-token budget was likely "
+        "consumed by adaptive thinking before the JSON answer was emitted."
+    )
+
+
+def call(api_key: str, model: str, system_prompt: str, user_prompt: str,
+         max_tokens: int = 8192, response_mode: str = "balanced") -> str:
+    """Single-turn streaming call returning raw text for caller-side parsing."""
+    client = Anthropic(
+        api_key=api_key,
+        timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+        max_retries=0,
+    )
     with client.messages.stream(
         model=model,
         max_tokens=max_tokens,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
+        **_thinking_controls(model, response_mode),
     ) as stream:
-        return stream.get_final_text()
+        return _get_final_text_with_metadata(stream)
 
 
-def call_with_cache(api_key: str, model: str, system_prompt: str, cacheable_context: str,
-                     dynamic_content: str, max_tokens: int = 8192) -> str:
-    """Like call(), but marks the two large blocks that repeat byte-identically
-    across many calls within one review job - the framework instructions
-    (system_prompt) and the document digest (cacheable_context) - as
-    ephemeral cache breakpoints. Anthropic only actually caches a block once
-    it's at least ~1024 tokens (Sonnet/Opus tier, which is all our model
-    allowlist contains); shorter content is sent normally with no error, it
-    just won't be cached. Cache entries live ~5 minutes, comfortably longer
-    than the few seconds between the chunk calls in one job's first pass.
+def call_with_cache(api_key: str, model: str, system_prompt: str,
+                    cacheable_context: str, dynamic_content: str,
+                    max_tokens: int = 8192,
+                    response_mode: str = "balanced") -> str:
+    """Streaming call with Anthropic prompt-cache breakpoints.
 
-    Uses client.messages.stream() rather than messages.create(). A real
-    incident traced to this: a single large chunk (an 80k-char document
-    section with a big framework system prompt, requesting up to
-    REVIEW_MAX_TOKENS of structured output) took long enough to generate
-    that the connection was terminated - NOT by our configured
-    LLM_REQUEST_TIMEOUT_SECONDS=150 (observed failure was at ~450s per
-    attempt, 908.6s total across the one retry - our client-side timeout
-    never fired), but by Anthropic's own handling of long-running
-    NON-streaming requests (the error explicitly cited
-    docs.anthropic.com/en/api/errors#long-requests). Streaming avoids this
-    failure mode entirely - data flows continuously for the duration of
-    generation - and, as a bonus, makes LLM_REQUEST_TIMEOUT_SECONDS mean
-    what it always should have: "no data for this long = give up", not
-    "the whole multi-minute generation must finish inside this window".
+    The framework and digest repeat byte-identically across chunk calls; the
+    detailed chunk remains uncached. SDK retries are disabled because retry and
+    adaptive splitting are owned by the application pipeline.
     """
-    client = Anthropic(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS, max_retries=0)
+    client = Anthropic(
+        api_key=api_key,
+        timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+        max_retries=0,
+    )
     content_blocks = []
     if cacheable_context:
         content_blocks.append({
-            "type": "text", "text": cacheable_context,
+            "type": "text",
+            "text": cacheable_context,
             "cache_control": {"type": "ephemeral"},
         })
     content_blocks.append({"type": "text", "text": dynamic_content})
@@ -64,24 +150,26 @@ def call_with_cache(api_key: str, model: str, system_prompt: str, cacheable_cont
         model=model,
         max_tokens=max_tokens,
         system=[{
-            "type": "text", "text": system_prompt,
+            "type": "text",
+            "text": system_prompt,
             "cache_control": {"type": "ephemeral"},
         }],
         messages=[{"role": "user", "content": content_blocks}],
+        **_review_output_controls(model, response_mode),
     ) as stream:
-        return stream.get_final_text()
+        return _get_final_text_with_metadata(stream)
 
 
 def validate_key(api_key: str, model: str) -> tuple[bool, str]:
-    """Cheap round-trip to confirm the key/model combo actually works. Short
-    timeout - this is a quick UI feedback check, not a real review call."""
+    """Cheap round-trip to confirm that the key/model combination works."""
     try:
         client = Anthropic(api_key=api_key, timeout=20.0, max_retries=0)
         client.messages.create(
             model=model,
-            max_tokens=8,
-            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=16,
+            messages=[{"role": "user", "content": "Reply with OK."}],
+            **_thinking_controls(model, "direct"),
         )
         return True, ""
-    except Exception as exc:  # noqa: BLE001 - surface any provider error to the UI
+    except Exception as exc:  # noqa: BLE001 - surface provider error to UI
         return False, str(exc)
