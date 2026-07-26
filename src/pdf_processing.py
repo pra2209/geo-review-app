@@ -1,31 +1,25 @@
-"""PDF ingestion: extract page text, tag by source file, and split into
-a "digest" (high-signal early pages, used for the project summary and as
-cross-reference context during review) plus size-bounded chunks for the
-detailed per-section review pass.
+"""PDF ingestion and bounded prompt preparation.
 
-Multiple uploaded files are treated as ONE project corpus (per product
-decision: GDR + referenced GIR etc. reviewed together), so page tags always
-carry the source filename.
+The application reviews multiple PDFs as one project corpus, but every page
+retains its source filename and 1-indexed page number for traceability.
+
+Two different bounded views are produced:
+
+* ``build_digest`` creates a small, fair-per-file opening-page digest used for
+  the summary and repeated cross-reference context.
+* ``chunk_pages`` creates detailed review chunks. It enforces both character
+  and page-fragment limits, never mixes source files in one chunk, and splits
+  an abnormally text-dense single page instead of allowing it to bypass the
+  chunk budget.
 """
 
 from dataclasses import dataclass
 
 import fitz  # PyMuPDF
 
-# Silences MuPDF's native (C-level) stderr output - things like "MuPDF error:
-# format error: cannot find object in xref (N 0 R)". These come from PyMuPDF's
-# internal repair/recovery pass on a PDF with malformed cross-reference table
-# entries (common in reports assembled/re-saved from multiple sources - scans,
-# CAD exports, merged appendices). They are USUALLY recoverable: extraction
-# still succeeds via fallback parsing, one warning per resolution attempt, and
-# a single malformed object can be referenced hundreds of times across a large
-# document, producing thousands of near-identical log lines that look alarming
-# but are not themselves the cause of a stuck/failed job (confirmed against a
-# real incident log - the actual failure that day was unrelated, see README
-# "Incident postmortem"). Silenced here so they stop causing false-alarm
-# confusion in the Cloud logs; get_and_clear_extraction_warnings() below still
-# captures a one-line summary so genuine signal (a badly corrupted PDF) isn't
-# lost outright.
+# Silences MuPDF's native repair/recovery warning stream. These warnings are
+# still retrievable through get_and_clear_extraction_warnings() so genuine
+# source-file problems remain diagnosable without flooding Streamlit logs.
 fitz.TOOLS.mupdf_display_errors(False)
 fitz.TOOLS.mupdf_display_warnings(False)
 
@@ -33,39 +27,46 @@ fitz.TOOLS.mupdf_display_warnings(False)
 @dataclass
 class Page:
     source_file: str
-    page_num: int  # 1-indexed
+    page_num: int  # 1-indexed PDF page number
     text: str
+    # A text-dense PDF page can be split into prompt-safe fragments. The
+    # original PDF page number remains unchanged for engineering traceability.
+    part_num: int = 1
+    part_count: int = 1
 
 
 DIGEST_PAGES_PER_FILE = 20
-# Was 80_000 (bumped from an original 40_000 purely to cut round-trip count -
-# fewer, bigger chunks = less total latency, reasoning that all three
-# providers support ~1M-token CONTEXT windows so input size wasn't the
-# limiter). That reasoning missed the real constraint: OUTPUT GENERATION
-# TIME, which isn't bounded by context window size. Two real jobs each
-# collapsed to a single ~80k-char chunk and each failed at ~908s against
-# what the evidence points to as a fixed ~900s external cap on total
-# request duration (see README "Incident postmortem" and
-# REVIEW_MAX_TOKENS in config.py, reduced for the same reason). A smaller
-# budget here does two things: bounds worst-case generation time per call,
-# AND restores multiple chunks (and therefore CHUNK_CONCURRENCY's actual
-# benefit) for large documents instead of one oversized, unparallelizable,
-# ceiling-risking chunk.
+# A page-count-only digest is not a reliable request-size bound. With the
+# maximum five uploads, the old 20-pages-per-file rule could repeat up to 100
+# pages of context on EVERY chunk request. The character caps below keep that
+# repeated prefix predictable while still allocating context to every file.
+DIGEST_TOTAL_CHAR_BUDGET = 30_000
+DIGEST_CHAR_BUDGET_PER_FILE = 30_000
+MIN_DIGEST_CHARS_PER_FILE = 3_000
+
+# Detailed review request limits. 45k is the incident-tested text ceiling from
+# the production handoff. The page-fragment cap prevents sparse reports from
+# combining hundreds of low-text pages into one request.
 DEFAULT_CHUNK_CHAR_BUDGET = 45_000
+DEFAULT_CHUNK_PAGE_LIMIT = 12
+MIN_PAGE_FRAGMENT_CHARS = 2_000
+
+# Scanned/image-only page warning threshold. Detection is deliberately kept
+# separate from OCR, which remains outside the current MVP scope.
+MIN_MEANINGFUL_CHARS_PER_PAGE = 30
 
 
 def extract_pages(filename: str, file_bytes: bytes) -> list[Page]:
-    """Extract text per page from one PDF's raw bytes."""
+    """Extract selectable text per page from one PDF's raw bytes."""
     pages: list[Page] = []
     with fitz.open(stream=file_bytes, filetype="pdf") as doc:
         for i, page in enumerate(doc, start=1):
-            text = page.get_text("text") or ""
-            pages.append(Page(source_file=filename, page_num=i, text=text))
+            pages.append(Page(source_file=filename, page_num=i, text=page.get_text("text") or ""))
     return pages
 
 
 def extract_all(files: list[tuple[str, bytes]]) -> list[Page]:
-    """files: list of (filename, bytes). Returns combined, order-preserved page list."""
+    """Return the combined, upload-order-preserved page list."""
     fitz.TOOLS.reset_mupdf_warnings()
     all_pages: list[Page] = []
     for filename, file_bytes in files:
@@ -74,56 +75,197 @@ def extract_all(files: list[tuple[str, bytes]]) -> list[Page]:
 
 
 def get_and_clear_extraction_warnings() -> list[str]:
-    """Call after extract_all() to see whether the source PDF(s) had any
-    recoverable structural issues (malformed xref entries etc.) - useful as a
-    one-line debug-log summary ("this PDF may be worth re-exporting from its
-    original source") without dumping the raw, often-thousands-of-lines
-    native warning stream anywhere."""
+    """Return recoverable MuPDF warning lines generated by the last extraction."""
     warnings = fitz.TOOLS.mupdf_warnings(reset=True)
     return warnings.splitlines() if warnings else []
 
 
-def build_digest(pages: list[Page], pages_per_file: int = DIGEST_PAGES_PER_FILE) -> list[Page]:
-    """First N pages of each source file - where scope, site description,
-    stratigraphy, parameter tables, seismicity, and code references typically
-    live. Used for the project summary and as lightweight cross-reference
-    context injected alongside every detailed chunk during review.
+def _semantic_cut(text: str, start: int, hard_end: int) -> int:
+    """Choose a stable break near ``hard_end`` without dropping characters."""
+    if hard_end >= len(text):
+        return len(text)
+
+    # Avoid a tiny leading fragment merely to hit an early paragraph boundary.
+    search_start = min(
+        hard_end,
+        start + max(MIN_PAGE_FRAGMENT_CHARS, (hard_end - start) // 2),
+    )
+    for separator in ("\n\n", "\n", ". ", "; ", ", ", " "):
+        idx = text.rfind(separator, search_start, hard_end)
+        if idx >= search_start:
+            return idx + len(separator)
+    return hard_end
+
+
+def split_page(page: Page, max_text_chars: int) -> list[Page]:
+    """Split one extracted PDF page into lossless, traceable fragments.
+
+    This closes the previous loophole where a single page larger than the
+    chunk budget was still emitted as one oversized chunk because page
+    boundaries were treated as indivisible.
     """
+    if max_text_chars <= 0:
+        raise ValueError("max_text_chars must be positive")
+    if len(page.text) <= max_text_chars:
+        return [page]
+
+    fragments: list[str] = []
+    pos = 0
+    while pos < len(page.text):
+        hard_end = min(len(page.text), pos + max_text_chars)
+        cut = _semantic_cut(page.text, pos, hard_end)
+        if cut <= pos:  # defensive: guarantee forward progress
+            cut = hard_end
+        fragments.append(page.text[pos:cut])
+        pos = cut
+
+    count = len(fragments)
+    return [
+        Page(
+            source_file=page.source_file,
+            page_num=page.page_num,
+            text=fragment,
+            part_num=index,
+            part_count=count,
+        )
+        for index, fragment in enumerate(fragments, start=1)
+    ]
+
+
+def _render_header(page: Page) -> str:
+    part_label = (
+        f" | part {page.part_num} of {page.part_count}"
+        if page.part_count > 1
+        else ""
+    )
+    return f"\n--- [{page.source_file} | page {page.page_num}{part_label}] ---\n"
+
+
+def _max_render_header_chars(page: Page) -> int:
+    """Conservative header size before a page's final fragment count is known."""
+    return len(
+        f"\n--- [{page.source_file} | page {page.page_num} "
+        "| part 999999 of 999999] ---\n"
+    )
+
+
+def _rendered_page_chars(page: Page) -> int:
+    return len(_render_header(page)) + len(page.text)
+
+
+def build_digest(
+    pages: list[Page],
+    pages_per_file: int = DIGEST_PAGES_PER_FILE,
+    total_char_budget: int = DIGEST_TOTAL_CHAR_BUDGET,
+    per_file_char_budget: int = DIGEST_CHAR_BUDGET_PER_FILE,
+) -> list[Page]:
+    """Build a bounded opening-page digest with fair allocation per file.
+
+    The old implementation bounded only page count, so adding more PDFs could
+    silently inflate every LLM request. This implementation caps rendered
+    characters and prevents the first large report from consuming all context.
+    """
+    if pages_per_file <= 0 or total_char_budget <= 0 or per_file_char_budget <= 0:
+        return []
+
     by_file: dict[str, list[Page]] = {}
-    for p in pages:
-        by_file.setdefault(p.source_file, []).append(p)
+    for page in pages:
+        by_file.setdefault(page.source_file, []).append(page)
+    if not by_file:
+        return []
+
+    file_count = len(by_file)
+    fair_share = max(1, total_char_budget // file_count)
+    if total_char_budget >= MIN_DIGEST_CHARS_PER_FILE * file_count:
+        fair_share = max(MIN_DIGEST_CHARS_PER_FILE, fair_share)
+    effective_file_budget = min(per_file_char_budget, fair_share)
+
     digest: list[Page] = []
-    for filename, file_pages in by_file.items():
-        digest.extend(file_pages[:pages_per_file])
+    total_used = 0
+    for file_pages in by_file.values():
+        file_used = 0
+        for page in file_pages[:pages_per_file]:
+            remaining = min(
+                effective_file_budget - file_used,
+                total_char_budget - total_used,
+            )
+            if remaining <= _max_render_header_chars(page):
+                break
+
+            rendered_chars = _rendered_page_chars(page)
+            if rendered_chars <= remaining:
+                selected = page
+            else:
+                text_budget = remaining - _max_render_header_chars(page)
+                if text_budget < MIN_PAGE_FRAGMENT_CHARS:
+                    break
+                selected = split_page(page, text_budget)[0]
+
+            digest.append(selected)
+            used = _rendered_page_chars(selected)
+            file_used += used
+            total_used += used
+            if total_used >= total_char_budget:
+                return digest
+
     return digest
 
 
-def chunk_pages(pages: list[Page], char_budget: int = DEFAULT_CHUNK_CHAR_BUDGET) -> list[list[Page]]:
-    """Group pages into chunks that fit a character budget, never splitting a
-    page across chunks. Chunk boundaries follow document order per file.
+def chunk_pages(
+    pages: list[Page],
+    char_budget: int = DEFAULT_CHUNK_CHAR_BUDGET,
+    max_pages: int = DEFAULT_CHUNK_PAGE_LIMIT,
+) -> list[list[Page]]:
+    """Create deterministic, prompt-safe detailed review chunks.
+
+    Guarantees:
+    * no rendered chunk exceeds ``char_budget``;
+    * no chunk exceeds ``max_pages`` page fragments;
+    * a chunk never crosses a source-file boundary;
+    * a single text-dense page is split losslessly into tagged fragments.
     """
+    if char_budget <= 128:
+        raise ValueError("char_budget is too small to hold a tagged page")
+    if max_pages <= 0:
+        raise ValueError("max_pages must be positive")
+
+    fragments: list[Page] = []
+    for page in pages:
+        max_text_chars = char_budget - _max_render_header_chars(page)
+        if max_text_chars <= 0:
+            raise ValueError(
+                f"char_budget is too small for the page tag generated by {page.source_file!r}"
+            )
+        fragments.extend(split_page(page, max_text_chars))
+
     chunks: list[list[Page]] = []
     current: list[Page] = []
     current_chars = 0
-    for p in pages:
-        page_chars = len(p.text)
-        if current and current_chars + page_chars > char_budget:
+    current_source: str | None = None
+
+    for fragment in fragments:
+        fragment_chars = _rendered_page_chars(fragment)
+        source_changed = bool(current and fragment.source_file != current_source)
+        would_exceed_chars = bool(current and current_chars + fragment_chars > char_budget)
+        would_exceed_pages = bool(current and len(current) >= max_pages)
+        if source_changed or would_exceed_chars or would_exceed_pages:
             chunks.append(current)
             current = []
             current_chars = 0
-        current.append(p)
-        current_chars += page_chars
+            current_source = None
+
+        current.append(fragment)
+        current_chars += fragment_chars
+        current_source = fragment.source_file
+
     if current:
         chunks.append(current)
     return chunks
 
 
 def render_pages_as_text(pages: list[Page]) -> str:
-    """Flatten a page list into a single tagged text block for an LLM prompt."""
-    parts = []
-    for p in pages:
-        parts.append(f"\n--- [{p.source_file} | page {p.page_num}] ---\n{p.text}")
-    return "".join(parts)
+    """Flatten pages/fragments into a tagged prompt block."""
+    return "".join(_render_header(page) + page.text for page in pages)
 
 
 def total_page_count(files: list[tuple[str, bytes]]) -> int:
@@ -134,21 +276,12 @@ def total_page_count(files: list[tuple[str, bytes]]) -> int:
     return total
 
 
-# A scanned/image-only page (or one that's just a photo/drawing with no
-# selectable text) extracts to few or zero characters even though the PDF
-# "opens fine" - the app then silently reviews far less content than the
-# user thinks it did. This isn't a full OCR pipeline (that's a real,
-# separate project - not something to build silently into an internal MVP
-# tool), but detecting and SURFACING the gap costs almost nothing and
-# directly prevents the worst outcome: a user trusting a review that quietly
-# skipped an appendix of borehole logs because they were scanned images.
-MIN_MEANINGFUL_CHARS_PER_PAGE = 30
-
-
 def compute_text_coverage(pages: list[Page]) -> dict:
-    """Returns {total_pages, low_text_pages, low_text_page_refs (capped
-    sample), low_text_fraction}. Call after extract_all() and surface a
-    warning if low_text_fraction is high - see app.py."""
+    """Return a compact summary of pages with little/no selectable text.
+
+    The output schema is intentionally kept compatible with the current
+    Streamlit UI and persisted job data.
+    """
     total = len(pages)
     low_text = [p for p in pages if len(p.text.strip()) < MIN_MEANINGFUL_CHARS_PER_PAGE]
     return {

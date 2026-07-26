@@ -18,7 +18,7 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 
 def _client(api_key: str, timeout: float = LLM_REQUEST_TIMEOUT_SECONDS) -> OpenAI:
-    return OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL, timeout=timeout)
+    return OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL, timeout=timeout, max_retries=0)
 
 
 def call(api_key: str, model: str, system_prompt: str, user_prompt: str,

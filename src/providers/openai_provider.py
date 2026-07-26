@@ -19,7 +19,7 @@ def call(api_key: str, model: str, system_prompt: str, user_prompt: str,
     than the newer .stream() helper, whose exact convenience-method surface
     has shifted across openai package versions).
     """
-    client = OpenAI(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
+    client = OpenAI(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS, max_retries=0)
     stream = client.chat.completions.create(
         model=model,
         max_completion_tokens=max_tokens,
@@ -54,7 +54,7 @@ def call_with_cache(api_key: str, model: str, system_prompt: str, cacheable_cont
 def validate_key(api_key: str, model: str) -> tuple[bool, str]:
     """Short timeout - this is a quick UI feedback check, not a real review call."""
     try:
-        client = OpenAI(api_key=api_key, timeout=20.0)
+        client = OpenAI(api_key=api_key, timeout=20.0, max_retries=0)
         client.chat.completions.create(
             model=model,
             max_completion_tokens=8,

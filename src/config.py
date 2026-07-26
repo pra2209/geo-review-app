@@ -48,6 +48,13 @@ DEFAULT_MODEL = {
 # needed per call) before this number - re-raising REVIEW_MAX_TOKENS
 # re-opens the risk this reduction closes.
 REVIEW_MAX_TOKENS = 12000
+# A timeout on a very small/unsplittable chunk is retried with a smaller
+# generation ceiling instead of repeating the identical request.
+REVIEW_RETRY_MIN_TOKENS = 4000
+# Recursive adaptive splitting is bounded to prevent one pathological chunk
+# from exploding into an unbounded number of provider calls.
+ADAPTIVE_SPLIT_MAX_DEPTH = 2
+ADAPTIVE_SPLIT_MAX_REQUESTS_PER_CHUNK = 8
 
 # Explicit per-request timeout. Previously unset (SDK defaults, which can run
 # several minutes) - a single stuck/slow call could silently eat most of a
