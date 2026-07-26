@@ -16,7 +16,9 @@ from src.config import ALLOWED_MODELS, CHUNK_CONCURRENCY, DEFAULT_MODEL, MAX_FIL
 from src import job_store
 from src.excel_io import write_excel, read_reviewer_comments, DISCLAIMER
 from src.llm_client import LLMConfig, validate_key
-from src.pdf_processing import extract_all, build_digest, chunk_pages, get_and_clear_extraction_warnings
+from src.pdf_processing import (extract_all, build_digest, chunk_pages,
+                                 get_and_clear_extraction_warnings, compute_text_coverage,
+                                 MIN_MEANINGFUL_CHARS_PER_PAGE)
 from src.review_pipeline import load_framework, run_first_pass, run_iteration, Finding
 from src.summary import generate_summary
 
@@ -26,6 +28,21 @@ STATUS_LABELS = {
     "D": "Rejected (critical)", "C": "Revise & Resubmit", "B": "Incorporate & Proceed",
     "A": "Proceed", "E": "Not Required",
 }
+
+
+def _get_secret(key: str, default=None):
+    """st.secrets.get(...) raises StreamlitSecretNotFoundError - not just
+    returning the default - when no secrets.toml file exists at all (as
+    opposed to existing but not containing this key, which .get() handles
+    fine). That distinction matters here: this app fails CLOSED with no
+    ACCESS_CODE configured, and a raw uncaught exception showing a full
+    traceback (including local filesystem paths) on a fresh checkout is a
+    worse failure mode than the friendly "not configured yet" message the
+    fail-closed path is supposed to show instead."""
+    try:
+        return st.secrets.get(key, default)
+    except Exception:  # noqa: BLE001 - secrets subsystem unavailable = key not set, not a crash
+        return default
 
 
 def _log_error(job_id: str, stage: str, exc: Exception, config: LLMConfig | None = None,
@@ -92,8 +109,10 @@ def _debug_log_download_button(job_id: str, key: str):
             mime="application/json",
             key=key,
             help="Full diagnostic detail - stage, traceback, raw model responses where "
-                 "available. Never includes your API key or PDF contents. Paste or upload "
-                 "this file directly when asking Claude Code to debug an issue.",
+                 "available. Never includes your API key or the PDF's binary content - but "
+                 "raw model responses can quote/paraphrase your report's content. Review "
+                 "before sharing outside your organization; safe to hand to Claude Code "
+                 "within this same session.",
         )
 
 
@@ -105,12 +124,24 @@ def render_password_gate() -> bool:
     if st.session_state.get("authenticated"):
         return True
     st.title("Geotechnical Report Review")
+
+    expected = _get_secret("ACCESS_CODE")
+    if not expected:
+        # Fails CLOSED, not open. This used to fall back to a hardcoded
+        # credential when Secrets wasn't configured yet - that made sense as
+        # a one-time bootstrap, but leaving a real credential checked into a
+        # public repo indefinitely is a genuine, unnecessary risk now that
+        # Secrets is demonstrably working (this deploy already has
+        # SHARED_PROVIDER etc. configured there). No ACCESS_CODE means no
+        # one gets in until an administrator sets one, full stop - not "use
+        # this password everyone can read on GitHub."
+        st.error("This app isn't configured yet: no ACCESS_CODE is set in Secrets. "
+                  "An administrator needs to set one before anyone can sign in.")
+        return False
+
     code = st.text_input("Access code", type="password")
     if st.button("Enter"):
-        # Falls back to a hardcoded default if Secrets isn't configured on the
-        # deploy target yet - Secrets, when set, still takes precedence.
-        expected = st.secrets.get("ACCESS_CODE", "richa@123")
-        if expected and code == expected:
+        if code == expected:
             st.session_state["authenticated"] = True
             st.rerun()
         else:
@@ -131,15 +162,15 @@ def render_llm_sidebar() -> LLMConfig | None:
     # this with a spend cap on that key in the provider's console; that cap,
     # not which UI issues the calls, is what actually bounds cost. Falls back
     # to today's BYOK-only flow untouched if none of this is configured.
-    shared_provider = st.secrets.get("SHARED_PROVIDER")
-    shared_model = st.secrets.get("SHARED_MODEL")
+    shared_provider = _get_secret("SHARED_PROVIDER")
+    shared_model = _get_secret("SHARED_MODEL")
     shared_key = None
     if shared_provider == "anthropic":
-        shared_key = st.secrets.get("SHARED_ANTHROPIC_API_KEY")
+        shared_key = _get_secret("SHARED_ANTHROPIC_API_KEY")
     elif shared_provider == "openai":
-        shared_key = st.secrets.get("SHARED_OPENAI_API_KEY")
+        shared_key = _get_secret("SHARED_OPENAI_API_KEY")
     elif shared_provider == "gemini":
-        shared_key = st.secrets.get("SHARED_GEMINI_API_KEY")
+        shared_key = _get_secret("SHARED_GEMINI_API_KEY")
     shared_available = bool(shared_provider and shared_model and shared_key)
 
     if shared_available:
@@ -217,6 +248,7 @@ def _start_summarization_bg(job_id: str, config: LLMConfig):
             files = job_store.get_uploaded_files(job_id)
             pages = extract_all(files)
             _log_extraction_warnings(job_id, "summarizing")
+            job_store.save_text_coverage(job_id, compute_text_coverage(pages))
             digest = build_digest(pages)
             summary = generate_summary(config, digest)
             job_store.save_summary(job_id, summary)
@@ -236,6 +268,17 @@ def render_summary_screen(job_id: str, config: LLMConfig | None):
     st.header("2. Project summary")
     summary = job_store.get_summary(job_id)
     st.markdown(summary)
+
+    coverage = job_store.get_text_coverage(job_id)
+    if coverage and coverage["total_pages"] and coverage["low_text_fraction"] > 0.15:
+        st.warning(
+            f"⚠️ {coverage['low_text_pages']} of {coverage['total_pages']} pages "
+            f"({coverage['low_text_fraction']:.0%}) extracted to almost no text "
+            f"(<{MIN_MEANINGFUL_CHARS_PER_PAGE} characters) - likely scanned images, "
+            "photos, or drawings with no selectable text. This app does not run OCR, so "
+            "**those pages will not be meaningfully reviewed**, even though they'll still "
+            "be counted as processed. Sample: " + ", ".join(coverage["low_text_page_refs"])
+        )
 
     st.header("3. Review logic that will be applied")
     with st.expander("Show the 14-step review framework", expanded=False):

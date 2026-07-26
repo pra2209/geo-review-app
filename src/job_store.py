@@ -189,6 +189,24 @@ def get_run_stats(job_id: str, iteration: int) -> Optional[dict]:
         return json.load(f)
 
 
+def save_text_coverage(job_id: str, coverage: dict):
+    """PDF text-extraction coverage stats (see pdf_processing.compute_text_coverage) -
+    surfaced on the summary screen BEFORE the user commits to a full review,
+    so a scanned/image-only appendix is a known, visible gap rather than a
+    silent one."""
+    path = os.path.join(_job_dir(job_id), "text_coverage.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(coverage, f, indent=2)
+
+
+def get_text_coverage(job_id: str) -> Optional[dict]:
+    path = os.path.join(_job_dir(job_id), "text_coverage.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 # --- Findings & Excel per iteration ------------------------------------------
 
 def save_findings(job_id: str, iteration: int, findings: list[Finding]):
@@ -282,9 +300,14 @@ def get_debug_log_bytes(job_id: str) -> bytes:
             events = json.load(f)
     bundle = {
         "_note": (
-            "Debug log for this review job. Does NOT include your API key or the "
-            "uploaded PDF file contents (only filenames/page counts are logged). "
-            "Safe to share for debugging - paste this whole file to Claude Code."
+            "Debug log for this review job. Never includes your API key or the "
+            "uploaded PDF's binary/file content (only filenames/page counts are "
+            "logged). HOWEVER: the 'raw_response' and 'error' fields can contain "
+            "text the model generated FROM your report - e.g. quoted or "
+            "paraphrased site details, parameter values, or findings - since "
+            "that's what a model's raw output actually is. Review before sharing "
+            "outside your organization if the report is confidential; safe to "
+            "hand to Claude Code within this same conversation/session."
         ),
         "job_id": job_id,
         "events": events,

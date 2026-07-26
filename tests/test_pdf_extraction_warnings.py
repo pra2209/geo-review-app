@@ -17,7 +17,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.pdf_processing import extract_all, get_and_clear_extraction_warnings
+from src.pdf_processing import extract_all, get_and_clear_extraction_warnings, compute_text_coverage, Page
 
 # Deliberately malformed: references a Pages object that doesn't exist and
 # has no valid xref table, triggering PyMuPDF's repair/recovery pass - the
@@ -76,8 +76,37 @@ def test_well_formed_pdf_produces_no_warnings():
     print("test_well_formed_pdf_produces_no_warnings: OK")
 
 
+def test_compute_text_coverage_flags_scanned_pages():
+    """A scanned/image-only page extracts to near-zero text even though the
+    PDF opens fine - this is the gap compute_text_coverage() exists to
+    surface to the user BEFORE they trust a review that silently skipped it."""
+    pages = [
+        Page(source_file="report.pdf", page_num=1, text="Plenty of real extracted text here " * 20),
+        Page(source_file="report.pdf", page_num=2, text=""),       # blank/image-only
+        Page(source_file="report.pdf", page_num=3, text="  \n "),  # whitespace-only
+        Page(source_file="report.pdf", page_num=4, text="Also plenty of real text here " * 20),
+    ]
+    coverage = compute_text_coverage(pages)
+    assert coverage["total_pages"] == 4
+    assert coverage["low_text_pages"] == 2
+    assert coverage["low_text_fraction"] == 0.5
+    assert "report.pdf p2" in coverage["low_text_page_refs"]
+    assert "report.pdf p3" in coverage["low_text_page_refs"]
+    print("test_compute_text_coverage_flags_scanned_pages: OK")
+
+
+def test_compute_text_coverage_clean_document_flags_nothing():
+    pages = [Page(source_file="report.pdf", page_num=i, text="Real content " * 10) for i in range(1, 6)]
+    coverage = compute_text_coverage(pages)
+    assert coverage["low_text_pages"] == 0
+    assert coverage["low_text_fraction"] == 0.0
+    print("test_compute_text_coverage_clean_document_flags_nothing: OK")
+
+
 if __name__ == "__main__":
     test_extraction_warnings_are_captured_not_lost()
     test_extraction_warnings_reset_between_calls()
     test_well_formed_pdf_produces_no_warnings()
+    test_compute_text_coverage_flags_scanned_pages()
+    test_compute_text_coverage_clean_document_flags_nothing()
     print("All tests passed.")

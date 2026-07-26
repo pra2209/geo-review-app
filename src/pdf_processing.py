@@ -38,13 +38,20 @@ class Page:
 
 
 DIGEST_PAGES_PER_FILE = 20
-# ~20k tokens/chunk. Bumped up from an earlier 40_000 (~10k tokens): all three
-# allowlisted providers now support ~1M-token context windows, so the old
-# budget was chunking far more granularly than needed - each extra chunk is a
-# full sequential-or-parallel LLM round trip, so fewer/bigger chunks directly
-# cuts total review latency. See review_pipeline.run_first_pass for the other
-# half of the latency fix (parallelizing the chunk calls).
-DEFAULT_CHUNK_CHAR_BUDGET = 80_000
+# Was 80_000 (bumped from an original 40_000 purely to cut round-trip count -
+# fewer, bigger chunks = less total latency, reasoning that all three
+# providers support ~1M-token CONTEXT windows so input size wasn't the
+# limiter). That reasoning missed the real constraint: OUTPUT GENERATION
+# TIME, which isn't bounded by context window size. Two real jobs each
+# collapsed to a single ~80k-char chunk and each failed at ~908s against
+# what the evidence points to as a fixed ~900s external cap on total
+# request duration (see README "Incident postmortem" and
+# REVIEW_MAX_TOKENS in config.py, reduced for the same reason). A smaller
+# budget here does two things: bounds worst-case generation time per call,
+# AND restores multiple chunks (and therefore CHUNK_CONCURRENCY's actual
+# benefit) for large documents instead of one oversized, unparallelizable,
+# ceiling-risking chunk.
+DEFAULT_CHUNK_CHAR_BUDGET = 45_000
 
 
 def extract_pages(filename: str, file_bytes: bytes) -> list[Page]:
@@ -125,3 +132,28 @@ def total_page_count(files: list[tuple[str, bytes]]) -> int:
         with fitz.open(stream=file_bytes, filetype="pdf") as doc:
             total += doc.page_count
     return total
+
+
+# A scanned/image-only page (or one that's just a photo/drawing with no
+# selectable text) extracts to few or zero characters even though the PDF
+# "opens fine" - the app then silently reviews far less content than the
+# user thinks it did. This isn't a full OCR pipeline (that's a real,
+# separate project - not something to build silently into an internal MVP
+# tool), but detecting and SURFACING the gap costs almost nothing and
+# directly prevents the worst outcome: a user trusting a review that quietly
+# skipped an appendix of borehole logs because they were scanned images.
+MIN_MEANINGFUL_CHARS_PER_PAGE = 30
+
+
+def compute_text_coverage(pages: list[Page]) -> dict:
+    """Returns {total_pages, low_text_pages, low_text_page_refs (capped
+    sample), low_text_fraction}. Call after extract_all() and surface a
+    warning if low_text_fraction is high - see app.py."""
+    total = len(pages)
+    low_text = [p for p in pages if len(p.text.strip()) < MIN_MEANINGFUL_CHARS_PER_PAGE]
+    return {
+        "total_pages": total,
+        "low_text_pages": len(low_text),
+        "low_text_fraction": round(len(low_text) / total, 3) if total else 0.0,
+        "low_text_page_refs": [f"{p.source_file} p{p.page_num}" for p in low_text[:10]],
+    }

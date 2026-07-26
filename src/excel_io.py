@@ -21,6 +21,7 @@ import io
 from typing import Optional
 
 import openpyxl
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -37,6 +38,33 @@ STATUS_COLORS = {"D": "FF0000", "C": "FFA500", "B": "FFFF00", "A": "00B050", "E"
 DISCLAIMER = ("AI-assisted draft review - requires verification by a licensed geotechnical "
               "engineer before use in formal submissions.")
 
+# Excel/CSV formula injection: a cell whose text starts with one of these is
+# interpreted as a FORMULA when the file is opened, not literal text. Every
+# string written here originates from either the LLM (report content can
+# itself be adversarial - prompt injection is explicitly a threat model for
+# this pipeline - or the model can independently emit a leading +/-/=/@) or
+# a re-uploaded reviewer comment (untrusted the moment this workbook might
+# be forwarded to someone else). This is NOT a theoretical risk for this
+# domain specifically: geotechnical elevation notation uses leading +/- as a
+# matter of routine ("+32.4m", "-2.45m" appear constantly in real reports),
+# so genuine, non-malicious content will trip this if unhandled.
+_FORMULA_PREFIXES = ("=", "+", "-", "@")
+_EXCEL_CELL_CHAR_LIMIT = 32767  # Excel's own hard per-cell limit
+
+
+def safe_excel_text(value: object) -> str:
+    """Neutralizes formula injection (prefixes a defusing apostrophe - Excel
+    then displays the text as entered, formula-looking prefix included, but
+    never evaluates it) and strips characters openpyxl cannot write at all
+    (control characters raise IllegalCharacterError otherwise). Apply to
+    EVERY untrusted string before it reaches a cell - LLM output and
+    re-uploaded reviewer comments alike."""
+    text = "" if value is None else str(value)
+    text = ILLEGAL_CHARACTERS_RE.sub("", text)
+    if text.startswith(_FORMULA_PREFIXES):
+        text = "'" + text
+    return text[:_EXCEL_CELL_CHAR_LIMIT]
+
 
 def write_excel(findings: list[Finding], job_id: str, comments_by: str = "System Review") -> bytes:
     wb = openpyxl.Workbook()
@@ -51,17 +79,17 @@ def write_excel(findings: list[Finding], job_id: str, comments_by: str = "System
     for row_idx, finding in enumerate(findings, start=2):
         finding.sl_no = row_idx - 1
         values = [
-            finding.sl_no,
-            finding.page_or_item,
-            finding.section_no,
-            finding.snapshot,
-            finding.discipline,
-            comments_by,
-            finding.review_comment,
-            finding.status,
-            finding.reviewer_comment,
-            finding.finding_id,
-            job_id,
+            finding.sl_no,  # int, not untrusted text - left as-is so it stays a real number in the sheet
+            safe_excel_text(finding.page_or_item),
+            safe_excel_text(finding.section_no),
+            safe_excel_text(finding.snapshot),
+            safe_excel_text(finding.discipline),
+            safe_excel_text(comments_by),
+            safe_excel_text(finding.review_comment),
+            safe_excel_text(finding.status),
+            safe_excel_text(finding.reviewer_comment),
+            safe_excel_text(finding.finding_id),
+            safe_excel_text(job_id),
         ]
         for col, value in enumerate(values, start=1):
             cell = ws.cell(row_idx, col, value)
