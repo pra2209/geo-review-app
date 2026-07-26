@@ -159,6 +159,47 @@ badly-corrupted source PDF remains visible - just as one line, not a log
 flood. Tested against both a deliberately malformed PDF and a well-formed
 one in `tests/test_pdf_extraction_warnings.py`.
 
+**A fifth incident, diagnosed from a downloaded debug log** (this feature
+earning its keep - the user found it via the app's own "Download error log"
+button and handed it over directly): a chunk call failed with
+`APITimeoutError`, `duration_seconds: 908.6`, against a configured
+`LLM_REQUEST_TIMEOUT_SECONDS = 150`. The two numbers not matching *was* the
+diagnosis - our client-side timeout never fired; something else killed the
+connection at roughly 450s per attempt. The error message pointed at the
+cause directly: it linked to
+`docs.anthropic.com/en/api/errors#long-requests`. All three providers were
+using a single non-streaming `create()` call. For a large chunk (this job
+had only 1 chunk total - the entire document fit under the 80k-char budget
+in one go, meaning the whole review depended on one large-output
+generation), that's exactly the shape of request Anthropic's own docs warn
+about: long non-streaming calls risk being terminated by infrastructure
+(not the caller's configured timeout) before they finish, regardless of how
+long the model would have taken given a stable connection.
+
+Fixed by switching all three providers to streaming
+(`client.messages.stream()` for Anthropic, `stream=True` + manual delta
+accumulation for OpenAI and Gemini, which shares the OpenAI client against
+a different `base_url`). This isn't just a timeout tweak - it avoids the
+failure mode entirely, since data flows continuously for the duration of
+generation instead of the connection sitting idle from the caller's
+perspective until the whole response is ready. As a side effect,
+`LLM_REQUEST_TIMEOUT_SECONDS` now means what it always should have ("no
+data for this long = give up") rather than "the whole multi-minute
+generation must complete inside this window" - the latter was never going
+to be a sane way to bound a review call that legitimately might need
+several minutes to produce a large, thorough finding set.
+
+`tests/test_prompt_caching.py` was updated to mock the streaming call shape
+instead of the old blocking one (same assertions - cache_control placement,
+base_url, prefix ordering - just against the new interface).
+`tests/test_streaming_accumulation.py` is new and tests the hand-written
+delta-accumulation logic specifically (Anthropic delegates accumulation to
+the SDK's `get_final_text()`, which doesn't need re-testing here; the
+OpenAI/Gemini manual chunk-joining loop is code we wrote and could get
+wrong - multiple chunks in order, and chunks with no delta content at all,
+which real streams send constantly for role-only/finish-reason-only
+frames).
+
 ## Latency
 
 For a large multi-hundred-page PDF, review time was originally dominated by

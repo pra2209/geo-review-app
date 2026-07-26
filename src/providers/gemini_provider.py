@@ -23,17 +23,29 @@ def _client(api_key: str, timeout: float = LLM_REQUEST_TIMEOUT_SECONDS) -> OpenA
 
 def call(api_key: str, model: str, system_prompt: str, user_prompt: str,
           max_tokens: int = 8192) -> str:
-    """Single-turn call. Returns raw text (caller parses JSON)."""
+    """Single-turn call. Returns raw text (caller parses JSON).
+
+    STREAMING, not a single blocking create() call - see anthropic_provider.py
+    for the production incident this pattern fixes (a long non-streaming
+    request got killed well past our configured client-side timeout, by
+    infrastructure that specifically targets long non-streaming calls). Same
+    risk applies through Google's OpenAI-compat endpoint.
+    """
     client = _client(api_key)
-    resp = client.chat.completions.create(
+    stream = client.chat.completions.create(
         model=model,
         max_tokens=max_tokens,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
+        stream=True,
     )
-    return resp.choices[0].message.content or ""
+    parts = []
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+            parts.append(chunk.choices[0].delta.content)
+    return "".join(parts)
 
 
 def call_with_cache(api_key: str, model: str, system_prompt: str, cacheable_context: str,

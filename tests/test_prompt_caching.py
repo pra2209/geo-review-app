@@ -2,6 +2,11 @@
 prompt-caching directives - without needing a real API key or network call.
 Mocks the provider SDK client and inspects the arguments it was called with.
 
+All three providers stream now (see anthropic_provider.py module docstring
+for the production incident - a long non-streaming call got killed well past
+our configured timeout - that this fixes), so the mocks here simulate a
+streaming response rather than a single blocking one.
+
 Run with: python -m pytest tests/ (or just: python tests/test_prompt_caching.py)
 """
 
@@ -14,19 +19,29 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.providers import anthropic_provider, openai_provider, gemini_provider
 
 
-def _fake_anthropic_response(text="[]"):
-    block = MagicMock()
-    block.type = "text"
-    block.text = text
-    resp = MagicMock()
-    resp.content = [block]
-    return resp
+def _mock_anthropic_stream(instance, text="[]"):
+    """client.messages.stream(...) is a context manager; stream.get_final_text()
+    returns the accumulated text. Configure the mock to behave that way."""
+    stream_cm = MagicMock()
+    stream_cm.__enter__.return_value.get_final_text.return_value = text
+    instance.messages.stream.return_value = stream_cm
+
+
+def _mock_openai_style_stream(instance, text="[]"):
+    """client.chat.completions.create(..., stream=True) returns an iterable
+    of chunks, each carrying one piece of the response in .choices[0].delta.content.
+    A single chunk carrying the whole text is sufficient for these tests -
+    they check the REQUEST payload, not chunk-by-chunk accumulation (that's
+    covered separately, see test_streaming_accumulation.py)."""
+    chunk = MagicMock()
+    chunk.choices = [MagicMock(delta=MagicMock(content=text))]
+    instance.chat.completions.create.return_value = [chunk]
 
 
 def test_anthropic_call_with_cache_marks_system_and_context_as_ephemeral():
     with patch("src.providers.anthropic_provider.Anthropic") as MockClient:
         instance = MockClient.return_value
-        instance.messages.create.return_value = _fake_anthropic_response()
+        _mock_anthropic_stream(instance)
 
         anthropic_provider.call_with_cache(
             api_key="fake-key", model="claude-sonnet-5",
@@ -36,7 +51,7 @@ def test_anthropic_call_with_cache_marks_system_and_context_as_ephemeral():
             max_tokens=1234,
         )
 
-        call_kwargs = instance.messages.create.call_args.kwargs
+        call_kwargs = instance.messages.stream.call_args.kwargs
 
         # System prompt must be a cache-marked content block, not a plain string,
         # or Anthropic has nothing to attach the cache breakpoint to.
@@ -64,7 +79,7 @@ def test_anthropic_call_with_cache_is_stable_across_repeated_calls():
     only dynamic_content differs."""
     with patch("src.providers.anthropic_provider.Anthropic") as MockClient:
         instance = MockClient.return_value
-        instance.messages.create.return_value = _fake_anthropic_response()
+        _mock_anthropic_stream(instance)
 
         for i, chunk_text in enumerate(["chunk one text", "chunk two text"], start=1):
             anthropic_provider.call_with_cache(
@@ -74,7 +89,7 @@ def test_anthropic_call_with_cache_is_stable_across_repeated_calls():
                 dynamic_content=f"chunk {i}: {chunk_text}",
             )
 
-        calls = instance.messages.create.call_args_list
+        calls = instance.messages.stream.call_args_list
         assert calls[0].kwargs["system"] == calls[1].kwargs["system"], \
             "system block changed between calls - cache would miss"
         assert calls[0].kwargs["messages"][0]["content"][0] == calls[1].kwargs["messages"][0]["content"][0], \
@@ -90,11 +105,7 @@ def test_openai_call_with_cache_preserves_prefix_order():
     puts cacheable_context first, dynamic_content second, unchanged."""
     with patch("src.providers.openai_provider.OpenAI") as MockClient:
         instance = MockClient.return_value
-        msg = MagicMock()
-        msg.message.content = "[]"
-        resp = MagicMock()
-        resp.choices = [msg]
-        instance.chat.completions.create.return_value = resp
+        _mock_openai_style_stream(instance)
 
         openai_provider.call_with_cache(
             api_key="fake-key", model="gpt-4.1",
@@ -104,6 +115,7 @@ def test_openai_call_with_cache_preserves_prefix_order():
         )
 
         call_kwargs = instance.chat.completions.create.call_args.kwargs
+        assert call_kwargs["stream"] is True, "must request a streaming response"
         user_message = call_kwargs["messages"][1]["content"]
         assert user_message.startswith("DIGEST"), "cacheable context must come first"
         assert user_message.endswith("CHUNK 1"), "dynamic content must come last"
@@ -117,9 +129,7 @@ def test_gemini_uses_google_endpoint_not_openais():
     error at best, or - worse - quietly charge the wrong account if a
     fallback key were ever present)."""
     with patch("src.providers.gemini_provider.OpenAI") as MockClient:
-        MockClient.return_value.chat.completions.create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content="[]"))]
-        )
+        _mock_openai_style_stream(MockClient.return_value)
         gemini_provider.call(api_key="fake-gemini-key", model="gemini-2.5-pro",
                               system_prompt="sys", user_prompt="usr")
         _, kwargs = MockClient.call_args
@@ -131,9 +141,7 @@ def test_gemini_uses_google_endpoint_not_openais():
 def test_gemini_call_with_cache_preserves_prefix_order():
     with patch("src.providers.gemini_provider.OpenAI") as MockClient:
         instance = MockClient.return_value
-        instance.chat.completions.create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content="[]"))]
-        )
+        _mock_openai_style_stream(instance)
 
         gemini_provider.call_with_cache(
             api_key="fake-key", model="gemini-2.5-pro",
@@ -141,6 +149,7 @@ def test_gemini_call_with_cache_preserves_prefix_order():
         )
 
         call_kwargs = instance.chat.completions.create.call_args.kwargs
+        assert call_kwargs["stream"] is True, "must request a streaming response"
         user_message = call_kwargs["messages"][1]["content"]
         assert user_message.startswith("DIGEST")
         assert user_message.endswith("CHUNK 1")
