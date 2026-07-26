@@ -124,13 +124,34 @@ def _findings_from_json(items: list[dict]) -> list[Finding]:
     return findings
 
 
+def _is_timeout_class_error(exc: Exception) -> bool:
+    """True for provider timeout errors (Anthropic/OpenAI both raise a class
+    literally named APITimeoutError) - distinguishes "this request took too
+    long to generate" from other failures (bad key, rate limit, malformed
+    request) where retrying with a SMALLER max_tokens would be pointless."""
+    return "Timeout" in type(exc).__name__
+
+
 def _process_one_chunk(i: int, total: int, chunk: list[Page], config: LLMConfig,
                         framework_text: str, cacheable_context: str,
                         retry_delay_seconds: float = 5.0) -> tuple[list[Finding], Optional[dict], dict]:
-    """Runs one chunk's call (+one short retry on failure) and times it.
-    Returns (findings, error_or_None, timing_dict). Designed to be safe to
-    call from a worker thread - touches no shared mutable state, everything
-    it needs is passed in explicitly."""
+    """Runs one chunk's call (+one retry on failure) and times it. Returns
+    (findings, error_or_None, timing_dict). Designed to be safe to call from
+    a worker thread - touches no shared mutable state, everything it needs
+    is passed in explicitly.
+
+    On a TIMEOUT-class failure specifically, the retry uses a REDUCED
+    max_tokens (half, floor 4000) instead of repeating the identical
+    request. Retrying an oversized request unchanged is not a retry, it's a
+    second guaranteed failure that just doubles the wasted time - confirmed
+    against two real incidents where both attempts failed identically at
+    ~908s (evidence points to a fixed ~900s external cap on total request
+    duration, independent of streaming - see README "Incident postmortem").
+    A smaller max_tokens directly bounds worst-case generation time, giving
+    the retry an actual chance instead of a foregone conclusion. Other
+    failure classes (rate limits, transient network errors) retry unchanged,
+    since a smaller max_tokens wouldn't address those.
+    """
     chunk_text = render_pages_as_text(chunk)
     dynamic_content = (
         f"DETAILED SECTION TO REVIEW NOW (chunk {i} of {total}):\n{chunk_text}\n\n"
@@ -140,18 +161,27 @@ def _process_one_chunk(i: int, total: int, chunk: list[Page], config: LLMConfig,
 
     start = time.perf_counter()
     last_exc: Optional[Exception] = None
+    last_traceback = ""
     raw = None
+    tokens_for_attempt = REVIEW_MAX_TOKENS
     for attempt in (1, 2):
         try:
             raw = call_with_cache(config, framework_text, cacheable_context, dynamic_content,
-                                   max_tokens=REVIEW_MAX_TOKENS)
+                                   max_tokens=tokens_for_attempt)
             items = _extract_json_array(raw)
             duration = round(time.perf_counter() - start, 1)
             return (_findings_from_json(items), None,
                     {"chunk": i, "total": total, "duration_seconds": duration, "attempts": attempt})
         except Exception as exc:  # noqa: BLE001 - one bad chunk must not sink the job
             last_exc = exc
+            last_traceback = traceback.format_exc()  # captured HERE, while still in except scope -
+            # calling this after the loop exits returns "NoneType: None" instead of the real
+            # traceback, since Python clears the "currently handled exception" once the except
+            # block's suite finishes. Confirmed against two real incident logs that both showed
+            # exactly that placeholder instead of a usable traceback.
             if attempt == 1:
+                if _is_timeout_class_error(exc):
+                    tokens_for_attempt = max(4000, REVIEW_MAX_TOKENS // 2)
                 time.sleep(retry_delay_seconds)  # brief pause; likely a transient/rate-limit blip
 
     duration = round(time.perf_counter() - start, 1)
@@ -160,9 +190,10 @@ def _process_one_chunk(i: int, total: int, chunk: list[Page], config: LLMConfig,
         "total": total,
         "error": f"Chunk {i} of {total} failed after retry: {last_exc}",
         "error_type": type(last_exc).__name__,
-        "traceback": traceback.format_exc(),
+        "traceback": last_traceback,
         "raw_response": raw,  # full text if the last attempt returned one but parsing failed
         "duration_seconds": duration,
+        "retry_used_reduced_tokens": tokens_for_attempt != REVIEW_MAX_TOKENS,
     }
     timing = {"chunk": i, "total": total, "duration_seconds": duration, "attempts": 2, "failed": True}
     return [], error, timing

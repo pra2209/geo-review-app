@@ -38,13 +38,16 @@ DEFAULT_MODEL = {
 }
 
 # --- LLM call tuning ----------------------------------------------------------
-# Bumped from an earlier 8192: a busy chunk with many findings (each review_comment
-# runs 150-400 words per the framework instructions) can legitimately need more
-# room, and a too-tight budget causes the model to cut a finding off mid-generation
-# rather than finishing cleanly. See review_pipeline._extract_json_array for the
-# complementary fix: even if truncation still happens, complete findings are
-# salvaged instead of the whole chunk's output being discarded.
-REVIEW_MAX_TOKENS = 20000
+# Was 20000 (bumped from an original 8192 to reduce truncation on a busy
+# chunk). Reduced back down after two real incidents where a single large
+# chunk's call ran ~908s and failed - evidence points to a fixed ~900s
+# external cap on total request duration that streaming does NOT protect
+# against (see README "Incident postmortem"). A smaller max_tokens directly
+# bounds worst-case generation time. If truncation becomes a live problem
+# again at this value, the fix is DEFAULT_CHUNK_CHAR_BUDGET (fewer findings
+# needed per call) before this number - re-raising REVIEW_MAX_TOKENS
+# re-opens the risk this reduction closes.
+REVIEW_MAX_TOKENS = 12000
 
 # Explicit per-request timeout. Previously unset (SDK defaults, which can run
 # several minutes) - a single stuck/slow call could silently eat most of a

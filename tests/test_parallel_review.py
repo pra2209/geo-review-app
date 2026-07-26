@@ -15,7 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.pdf_processing import Page
-from src.review_pipeline import run_first_pass, _process_one_chunk
+from src.review_pipeline import run_first_pass, _process_one_chunk, _is_timeout_class_error
 from src.llm_client import LLMConfig
 
 FAKE_CONFIG = LLMConfig(provider="anthropic", model="claude-sonnet-5", api_key="fake-key")
@@ -129,6 +129,89 @@ def test_process_one_chunk_gives_up_after_two_failures():
     print("test_process_one_chunk_gives_up_after_two_failures: OK")
 
 
+def test_process_one_chunk_captures_real_traceback_not_nonetype_none():
+    """Regression test for a bug found via two real incident debug logs, both
+    showing "traceback": "NoneType: None" instead of anything useful -
+    traceback.format_exc() was being called AFTER the code had left the
+    except block's scope (once the retry loop over both attempts completed),
+    where Python has already cleared the 'currently handled exception'
+    context. Fix: capture it INSIDE the except block, while still valid."""
+    chunk = [_page("report.pdf", 1, "content")]
+
+    def always_fails(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+        raise RuntimeError("a distinctive failure message for this test")
+
+    with patch("src.review_pipeline.call_with_cache", side_effect=always_fails):
+        _, error, _ = _process_one_chunk(
+            1, 1, chunk, FAKE_CONFIG, "framework", "digest", retry_delay_seconds=0.01)
+
+    assert error["traceback"] != "NoneType: None\n", (
+        "traceback capture regressed - this is the exact bug from the incident logs")
+    assert "a distinctive failure message for this test" in error["traceback"], (
+        f"expected the real traceback to mention the failure, got: {error['traceback']!r}")
+    assert "RuntimeError" in error["traceback"]
+    print("test_process_one_chunk_captures_real_traceback_not_nonetype_none: OK")
+
+
+class _FakeAPITimeoutError(Exception):
+    """Named to match the real SDKs' exception class name pattern (both
+    Anthropic and OpenAI raise a class literally called APITimeoutError) -
+    _is_timeout_class_error() checks the TYPE NAME, not the module, so this
+    fake is a faithful stand-in without needing either real SDK installed."""
+
+
+def test_timeout_class_failure_retries_with_reduced_max_tokens():
+    """The actual fix for the real incident: retrying an oversized request
+    with the IDENTICAL max_tokens is not a retry, it's a second guaranteed
+    failure (both real incidents failed identically on both attempts, ~908s
+    each). A timeout-class failure should retry with a SMALLER max_tokens,
+    giving the retry an actual chance to finish before hitting whatever
+    ceiling caused the first failure."""
+    chunk = [_page("report.pdf", 1, "content")]
+    calls = []
+
+    def fails_once_with_timeout(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+        calls.append(max_tokens)
+        if len(calls) == 1:
+            raise _FakeAPITimeoutError("Request timed out")
+        return _finding_json("Recovered with smaller budget")
+
+    with patch("src.review_pipeline.call_with_cache", side_effect=fails_once_with_timeout):
+        with patch("src.review_pipeline.REVIEW_MAX_TOKENS", 12000):
+            findings, error, timing = _process_one_chunk(
+                1, 1, chunk, FAKE_CONFIG, "framework", "digest", retry_delay_seconds=0.01)
+
+    assert error is None, f"expected the reduced-budget retry to succeed, got: {error}"
+    assert len(calls) == 2
+    assert calls[0] == 12000, "first attempt should use the full configured budget"
+    assert calls[1] == 6000, f"retry after a timeout should halve max_tokens, got {calls[1]}"
+    print("test_timeout_class_failure_retries_with_reduced_max_tokens: OK")
+
+
+def test_non_timeout_failure_retries_with_unchanged_max_tokens():
+    """A rate-limit or generic transient error has nothing to do with
+    response size - retrying with a smaller max_tokens wouldn't help and
+    would just produce a worse (truncated) result for no reason. Only
+    timeout-class failures should trigger the reduction."""
+    chunk = [_page("report.pdf", 1, "content")]
+    calls = []
+
+    def fails_once_not_timeout(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+        calls.append(max_tokens)
+        if len(calls) == 1:
+            raise RuntimeError("429 rate limited")
+        return _finding_json("Recovered")
+
+    with patch("src.review_pipeline.call_with_cache", side_effect=fails_once_not_timeout):
+        with patch("src.review_pipeline.REVIEW_MAX_TOKENS", 12000):
+            findings, error, timing = _process_one_chunk(
+                1, 1, chunk, FAKE_CONFIG, "framework", "digest", retry_delay_seconds=0.01)
+
+    assert error is None
+    assert calls == [12000, 12000], f"non-timeout retry should NOT reduce max_tokens, got {calls}"
+    print("test_non_timeout_failure_retries_with_unchanged_max_tokens: OK")
+
+
 def test_cancellation_stops_not_yet_started_chunks_but_keeps_completed_findings():
     """8 chunks, only 2 workers, each call takes 0.1s. cancel_check flips to
     True after the first chunk completes - by then only ~2 chunks have had a
@@ -174,10 +257,21 @@ def test_cancellation_stops_not_yet_started_chunks_but_keeps_completed_findings(
           f"({calls_made['count']}/8 chunks ran before cancel)")
 
 
+def test_is_timeout_class_error_matches_by_type_name():
+    assert _is_timeout_class_error(_FakeAPITimeoutError("x")) is True
+    assert _is_timeout_class_error(RuntimeError("429 rate limited")) is False
+    assert _is_timeout_class_error(ValueError("bad json")) is False
+    print("test_is_timeout_class_error_matches_by_type_name: OK")
+
+
 if __name__ == "__main__":
     test_run_first_pass_preserves_chunk_order_despite_reversed_completion()
     test_run_first_pass_runs_concurrently_not_sequentially()
     test_process_one_chunk_retries_once_then_succeeds()
     test_process_one_chunk_gives_up_after_two_failures()
+    test_process_one_chunk_captures_real_traceback_not_nonetype_none()
+    test_timeout_class_failure_retries_with_reduced_max_tokens()
+    test_non_timeout_failure_retries_with_unchanged_max_tokens()
+    test_is_timeout_class_error_matches_by_type_name()
     test_cancellation_stops_not_yet_started_chunks_but_keeps_completed_findings()
     print("All tests passed.")
