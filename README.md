@@ -333,3 +333,51 @@ the current functions are already structured to make that split easy later.
   revisiting alongside `CHUNK_CONCURRENCY` if this sees real multi-user
   traffic, since concurrent requests per job now multiply by concurrent
   users too.
+
+## Security & production-readiness roadmap
+
+An external audit (26 July 2026, `geotechnical_review_app_QA_audit.md`)
+reviewed the app against confidential-data and multi-user use. Verdict at
+the time: real release-blocking gaps, on top of the reliability work
+already documented above. Findings were checked against the actual code
+(not all external audit claims are accurate - these were) before acting.
+
+**Fixed** (see the "Address P0 findings..." commit for full detail on each):
+Excel formula injection (LLM/reviewer text could become a live formula when
+opened - now sanitized); a hardcoded access-code fallback (was added
+earlier as a deliberate bootstrap when Secrets wasn't reachable yet - now
+removed, app fails closed with no ACCESS_CODE configured); an unused
+devcontainer config with CORS/XSRF protection disabled (auto-generated
+cruft, never part of this app's actual deployment path - removed); an
+overstated "safe to share" claim on the debug log (reworded - raw model
+output can contain report-derived text); silent scanned/image-only PDF
+pages (now flagged with a visible warning before the user commits to a
+review run, naming the affected pages).
+
+**Deliberately not built**, because each is a real scope/timeline decision
+for whoever owns this app, not a bug to silently fix:
+- **User/job ownership & real authentication** - a job today is a bearer
+  URL behind one shared access code, no per-user identity. This is the
+  direct, known consequence of the explicit "no login in MVP" decision
+  documented in `APP_BUILD_PLAN_v1.md`, not an oversight.
+- **A durable job queue** - background review threads don't survive a
+  process restart/redeploy. Acceptable for a small internal tool (see
+  "Incident postmortem" above for what that risk actually looks like in
+  practice); a real fix means moving off in-process threads entirely.
+- **OCR for scanned pages** - detected and warned about (see "Fixed"
+  above), not solved. Actually reviewing scanned content means a
+  rendering/OCR pipeline, a genuinely separate project.
+- **Structured-output schema validation, deduplication, and a
+  licensed-engineer-reviewed quality benchmark** - the framework instructs
+  the model on expected shape, but nothing currently rejects a malformed
+  finding, and there's no measured precision/recall against real
+  engineering judgment. Matters most before this output is trusted for
+  anything beyond a first-pass draft.
+- **CI, dependency pinning, and a live-provider canary** - there's no
+  automated pipeline running the test suite or catching a provider API
+  contract change before a user does.
+
+None of this changes the standing guidance already in this README: keep
+non-confidential/synthetic reports for exploratory use until the ownership
+and durability gaps above are closed, same logic as the Anthropic ZDR note
+in `APP_BUILD_PLAN_v1.md` §0.
