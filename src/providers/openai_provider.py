@@ -6,7 +6,7 @@ from src.config import LLM_REQUEST_TIMEOUT_SECONDS
 
 
 def call(api_key: str, model: str, system_prompt: str, user_prompt: str,
-          max_tokens: int = 8192) -> str:
+          max_tokens: int = 8192, response_mode: str = "balanced") -> str:
     """Single-turn call. Returns raw text (caller parses JSON).
 
     STREAMING, not a single blocking create() call - see anthropic_provider.py
@@ -19,7 +19,7 @@ def call(api_key: str, model: str, system_prompt: str, user_prompt: str,
     than the newer .stream() helper, whose exact convenience-method surface
     has shifted across openai package versions).
     """
-    client = OpenAI(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
+    client = OpenAI(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS, max_retries=0)
     stream = client.chat.completions.create(
         model=model,
         max_completion_tokens=max_tokens,
@@ -37,7 +37,7 @@ def call(api_key: str, model: str, system_prompt: str, user_prompt: str,
 
 
 def call_with_cache(api_key: str, model: str, system_prompt: str, cacheable_context: str,
-                     dynamic_content: str, max_tokens: int = 8192) -> str:
+                     dynamic_content: str, max_tokens: int = 8192, response_mode: str = "balanced") -> str:
     """Same interface as the Anthropic provider's call_with_cache(), for a
     consistent llm_client.py surface across providers. Unlike Anthropic,
     OpenAI needs no explicit cache directive - it automatically caches the
@@ -48,13 +48,13 @@ def call_with_cache(api_key: str, model: str, system_prompt: str, cacheable_cont
     this does by construction. Delegates to call() above, which streams.
     """
     user_content = f"{cacheable_context}\n\n{dynamic_content}" if cacheable_context else dynamic_content
-    return call(api_key, model, system_prompt, user_content, max_tokens)
+    return call(api_key, model, system_prompt, user_content, max_tokens, response_mode=response_mode)
 
 
 def validate_key(api_key: str, model: str) -> tuple[bool, str]:
     """Short timeout - this is a quick UI feedback check, not a real review call."""
     try:
-        client = OpenAI(api_key=api_key, timeout=20.0)
+        client = OpenAI(api_key=api_key, timeout=20.0, max_retries=0)
         client.chat.completions.create(
             model=model,
             max_completion_tokens=8,

@@ -20,9 +20,22 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
-from src.config import CHUNK_CONCURRENCY, FRAMEWORK_PATH, REVIEW_MAX_TOKENS
+from src.config import (
+    ADAPTIVE_SPLIT_MAX_DEPTH,
+    ADAPTIVE_SPLIT_MAX_REQUESTS_PER_CHUNK,
+    CHUNK_CONCURRENCY,
+    FRAMEWORK_PATH,
+    REVIEW_MAX_TOKENS,
+    REVIEW_RETRY_MIN_TOKENS,
+)
 from src.llm_client import LLMConfig, call_with_cache
-from src.pdf_processing import Page, render_pages_as_text
+from src.pdf_processing import (
+    MIN_PAGE_FRAGMENT_CHARS,
+    Page,
+    describe_pages,
+    render_pages_as_text,
+    split_page,
+)
 
 
 @dataclass
@@ -46,30 +59,34 @@ def load_framework() -> str:
 
 
 class TruncatedResponseError(ValueError):
-    """Raised when a model response could not yield any usable findings -
-    typically because it was cut off (hit max_tokens) before completing even
-    one finding object. Distinct from a generic parse error so callers can
-    decide whether to treat it as fatal or just "this chunk got nothing"."""
+    """No complete finding object could be recovered from a model response."""
+
+    def __init__(self, message: str, raw_text: str = ""):
+        super().__init__(message)
+        self.raw_text = raw_text
 
 
-def _extract_json_array(raw_text: str) -> list[dict]:
-    """Extract finding objects from the model's response, tolerating a
-    response that got cut off mid-generation (hit max_tokens) rather than
-    failing the whole chunk. Strategy:
+class PartialResponseError(ValueError):
+    """The response contained complete findings but ended malformed/truncated.
 
-    1. Strip a markdown code fence if present (opening AND/OR closing - a
-       truncated response may have the opening fence but never reach a
-       closing one).
-    2. Try a fast, direct json.loads() first - handles the common
-       well-formed case with zero overhead.
-    3. If that fails, walk the text looking for top-level `{...}` objects
-       and decode each independently via json.JSONDecoder.raw_decode(). Any
-       objects that finished generating are kept; a final, incomplete object
-       (the one that was mid-flight when the response got cut off) is
-       silently dropped rather than poisoning the whole batch.
+    Keeping the recovered items on the exception lets the adaptive retry path
+    fall back to them if a smaller split request also fails, without silently
+    presenting an incomplete response as fully successful.
+    """
 
-    Raises TruncatedResponseError only if NOT EVEN ONE complete object could
-    be recovered (e.g. cut off during the very first finding).
+    def __init__(self, message: str, items: list[dict], raw_text: str):
+        super().__init__(message)
+        self.items = items
+        self.raw_text = raw_text
+
+
+def _extract_json_array_details(raw_text: str) -> tuple[list[dict], bool]:
+    """Return ``(items, salvaged)`` from a model response.
+
+    ``salvaged`` is true when complete objects were recovered from otherwise
+    invalid JSON. The public compatibility wrapper below still returns only
+    the items, while the review worker uses this signal to adaptively split
+    and retry instead of silently accepting an incomplete generation.
     """
     text = raw_text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -78,9 +95,10 @@ def _extract_json_array(raw_text: str) -> list[dict]:
     try:
         parsed = json.loads(text)
         if isinstance(parsed, list):
-            return parsed
-        # A single object rather than an array - still usable.
-        return [parsed]
+            return parsed, False
+        if isinstance(parsed, dict):
+            return [parsed], False
+        raise ValueError("Model response JSON must be an object or array of objects")
     except json.JSONDecodeError:
         pass
 
@@ -90,21 +108,26 @@ def _extract_json_array(raw_text: str) -> list[dict]:
     while search_pos != -1:
         try:
             obj, end_pos = decoder.raw_decode(text, search_pos)
-            objects.append(obj)
+            if isinstance(obj, dict):
+                objects.append(obj)
             search_pos = text.find("{", end_pos)
         except json.JSONDecodeError:
-            # The object starting here is incomplete/malformed - this is
-            # expected at the tail of a truncated response. Stop; anything
-            # found before this point is still good.
             break
 
     if not objects:
         raise TruncatedResponseError(
             "Model response ended before any finding finished generating "
-            "(likely hit the output token limit on the very first item). "
-            f"Raw response (first 1500 chars): {raw_text[:1500]}"
+            "(likely hit the output token limit or a request-duration limit on the first item). "
+            f"Raw response (first 1500 chars): {raw_text[:1500]}",
+            raw_text=raw_text,
         )
-    return objects
+    return objects, True
+
+
+def _extract_json_array(raw_text: str) -> list[dict]:
+    """Compatibility wrapper used by existing tests and iteration mode."""
+    items, _ = _extract_json_array_details(raw_text)
+    return items
 
 
 def _findings_from_json(items: list[dict]) -> list[Finding]:
@@ -124,79 +147,350 @@ def _findings_from_json(items: list[dict]) -> list[Finding]:
     return findings
 
 
+
+def _decode_partial_json_string(value: str) -> str:
+    try:
+        return json.loads(f'"{value}"')
+    except (json.JSONDecodeError, TypeError):
+        return value.replace('\\"', '"').replace('\\n', ' ')
+
+
+def _extract_incomplete_finding_hint(raw_text: Optional[str]) -> Optional[dict]:
+    """Recover locator fields from an unfinished first finding, when available.
+
+    This is diagnostic metadata only. It must never be treated as a validated
+    finding because the model did not finish the JSON object.
+    """
+    if not raw_text:
+        return None
+    hint: dict[str, str] = {}
+    for field in ("source_file", "page_or_item", "section_no", "snapshot"):
+        match = re.search(rf'"{field}"\s*:\s*"((?:\\.|[^"\\])*)"', raw_text)
+        if match:
+            hint[field] = _decode_partial_json_string(match.group(1)).strip()
+    return hint or None
+
+
+def _is_no_text_output_error(exc: Exception) -> bool:
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    return (
+        "notext" in name
+        or "outputexhausted" in name
+        or "no text content block" in message
+        or "only thinking content block" in message
+        or "returned thinking content block" in message
+    )
+
 def _is_timeout_class_error(exc: Exception) -> bool:
-    """True for provider timeout errors (Anthropic/OpenAI both raise a class
-    literally named APITimeoutError) - distinguishes "this request took too
-    long to generate" from other failures (bad key, rate limit, malformed
-    request) where retrying with a SMALLER max_tokens would be pointless."""
-    return "Timeout" in type(exc).__name__
+    """Provider-neutral timeout detection for Anthropic/OpenAI/Gemini SDKs."""
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    return (
+        "timeout" in name
+        or "timed out" in message
+        or "request timeout" in message
+        or "request was interrupted" in message
+        or "request timed out or interrupted" in message
+    )
+
+
+def _is_request_size_error(exc: Exception) -> bool:
+    """Detect context/request-size failures whose correct recovery is splitting."""
+    message = str(exc).lower()
+    indicators = (
+        "context length",
+        "context_length",
+        "maximum context",
+        "too many tokens",
+        "request too large",
+        "payload too large",
+        "maximum request size",
+        "413",
+    )
+    return any(indicator in message for indicator in indicators)
+
+
+def _should_split_after_failure(exc: Exception) -> bool:
+    return (
+        isinstance(exc, (TruncatedResponseError, PartialResponseError))
+        or _is_timeout_class_error(exc)
+        or _is_request_size_error(exc)
+        or _is_no_text_output_error(exc)
+    )
+
+
+def _preserve_output_budget_after_split(exc: Exception) -> bool:
+    """Output exhaustion needs smaller input but not a smaller response budget."""
+    return (
+        isinstance(exc, (TruncatedResponseError, PartialResponseError))
+        or _is_no_text_output_error(exc)
+    )
+
+
+def _split_chunk_for_retry(chunk: list[Page]) -> Optional[tuple[list[Page], list[Page]]]:
+    """Bisect a failed chunk by rendered size, splitting one dense page if needed."""
+    if len(chunk) > 1:
+        weights = [len(page.text) + 180 for page in chunk]
+        target = sum(weights) / 2
+        running = 0
+        split_at = 1
+        for index, weight in enumerate(weights[:-1], start=1):
+            running += weight
+            split_at = index
+            if running >= target:
+                break
+        return chunk[:split_at], chunk[split_at:]
+
+    if not chunk:
+        return None
+    page = chunk[0]
+    if len(page.text) < MIN_PAGE_FRAGMENT_CHARS * 2:
+        return None
+    fragments = split_page(page, max(MIN_PAGE_FRAGMENT_CHARS, len(page.text) // 2))
+    if len(fragments) < 2:
+        return None
+    midpoint = max(1, len(fragments) // 2)
+    return fragments[:midpoint], fragments[midpoint:]
+
+
+def _dynamic_content(label: str, chunk: list[Page]) -> str:
+    chunk_text = render_pages_as_text(chunk)
+    return (
+        f"DETAILED SECTION TO REVIEW NOW ({label}):\n{chunk_text}\n\n"
+        "Review only this section against all 14 steps that apply to its content, "
+        "using the digest only for cross-reference and traceability. Return the JSON "
+        "findings array immediately, with no prose or markdown fences. Keep each finding "
+        "concise and prioritize finishing the complete array over elaborating any one item."
+    )
 
 
 def _process_one_chunk(i: int, total: int, chunk: list[Page], config: LLMConfig,
-                        framework_text: str, cacheable_context: str,
-                        retry_delay_seconds: float = 5.0) -> tuple[list[Finding], Optional[dict], dict]:
-    """Runs one chunk's call (+one retry on failure) and times it. Returns
-    (findings, error_or_None, timing_dict). Designed to be safe to call from
-    a worker thread - touches no shared mutable state, everything it needs
-    is passed in explicitly.
+                       framework_text: str, cacheable_context: str,
+                       retry_delay_seconds: float = 5.0) -> tuple[list[Finding], Optional[dict], dict]:
+    """Review one top-level chunk with bounded recursive recovery.
 
-    On a TIMEOUT-class failure specifically, the retry uses a REDUCED
-    max_tokens (half, floor 4000) instead of repeating the identical
-    request. Retrying an oversized request unchanged is not a retry, it's a
-    second guaranteed failure that just doubles the wasted time - confirmed
-    against two real incidents where both attempts failed identically at
-    ~908s (evidence points to a fixed ~900s external cap on total request
-    duration, independent of streaming - see README "Incident postmortem").
-    A smaller max_tokens directly bounds worst-case generation time, giving
-    the retry an actual chance instead of a foregone conclusion. Other
-    failure classes (rate limits, transient network errors) retry unchanged,
-    since a smaller max_tokens wouldn't address those.
+    Recovery policy:
+    * timeout, request-size and truncated/partial-output failures split the
+      input into smaller children rather than repeating the same doomed call;
+    * a child may split again, but depth and total request count are capped;
+    * an unsplittable leaf gets one retry; timeout retries use a smaller
+      generation ceiling, while thinking-only/truncated-output retries preserve
+      the JSON budget and switch Anthropic to direct-output mode;
+    * successful child findings are retained even if a sibling ultimately
+      fails, and the caller receives an explicit partial-result warning.
     """
-    chunk_text = render_pages_as_text(chunk)
-    dynamic_content = (
-        f"DETAILED SECTION TO REVIEW NOW (chunk {i} of {total}):\n{chunk_text}\n\n"
-        "Review this chunk against all 14 steps that apply to its content, using the digest "
-        "for traceability where needed. Return the JSON findings array now."
-    )
-
     start = time.perf_counter()
-    last_exc: Optional[Exception] = None
+    request_count = 0
+    adaptive_splits = 0
+    last_raw: Optional[str] = None
     last_traceback = ""
-    raw = None
-    tokens_for_attempt = REVIEW_MAX_TOKENS
-    for attempt in (1, 2):
-        try:
-            raw = call_with_cache(config, framework_text, cacheable_context, dynamic_content,
-                                   max_tokens=tokens_for_attempt)
-            items = _extract_json_array(raw)
-            duration = round(time.perf_counter() - start, 1)
-            return (_findings_from_json(items), None,
-                    {"chunk": i, "total": total, "duration_seconds": duration, "attempts": attempt})
-        except Exception as exc:  # noqa: BLE001 - one bad chunk must not sink the job
-            last_exc = exc
-            last_traceback = traceback.format_exc()  # captured HERE, while still in except scope -
-            # calling this after the loop exits returns "NoneType: None" instead of the real
-            # traceback, since Python clears the "currently handled exception" once the except
-            # block's suite finishes. Confirmed against two real incident logs that both showed
-            # exactly that placeholder instead of a usable traceback.
-            if attempt == 1:
-                if _is_timeout_class_error(exc):
-                    tokens_for_attempt = max(4000, REVIEW_MAX_TOKENS // 2)
-                time.sleep(retry_delay_seconds)  # brief pause; likely a transient/rate-limit blip
+    failure_messages: list[str] = []
+    failure_types: list[str] = []
+    failed_parts: list[dict] = []
+    response_hints: list[dict] = []
+    parent_salvage_used = False
 
+    def invoke(part: list[Page], label: str, max_tokens: int,
+               response_mode: str = "balanced") -> list[Finding]:
+        nonlocal request_count, last_raw
+        if request_count >= ADAPTIVE_SPLIT_MAX_REQUESTS_PER_CHUNK:
+            raise RuntimeError(
+                "Adaptive retry request limit reached for this chunk "
+                f"({ADAPTIVE_SPLIT_MAX_REQUESTS_PER_CHUNK} provider calls)."
+            )
+        request_count += 1
+        last_raw = None
+        last_raw = call_with_cache(
+            config,
+            framework_text,
+            cacheable_context,
+            _dynamic_content(label, part),
+            max_tokens=max_tokens,
+            response_mode=response_mode,
+        )
+        items, salvaged = _extract_json_array_details(last_raw)
+        if salvaged:
+            raise PartialResponseError(
+                f"{label} returned incomplete JSON; complete objects were salvaged",
+                items,
+                last_raw,
+            )
+        return _findings_from_json(items)
+
+    def review_part(
+        part: list[Page],
+        label: str,
+        depth: int,
+        max_tokens: int,
+    ) -> tuple[list[Finding], bool]:
+        """Return (findings, complete). ``complete`` is false if any leaf failed."""
+        nonlocal adaptive_splits, last_traceback, last_raw, parent_salvage_used
+
+        def capture_failure(exc: Exception) -> tuple[list[Finding], Optional[dict]]:
+            """Capture recoverable output and a locator from one failed request."""
+            nonlocal last_raw
+            if isinstance(exc, PartialResponseError):
+                last_raw = exc.raw_text
+                recovered = _findings_from_json(exc.items)
+            elif isinstance(exc, TruncatedResponseError):
+                last_raw = exc.raw_text
+                recovered = []
+            else:
+                raw = getattr(exc, "raw_text", None)
+                if raw is not None:
+                    last_raw = raw
+                recovered = []
+            locator = _extract_incomplete_finding_hint(last_raw)
+            if locator and locator not in response_hints:
+                response_hints.append(locator)
+            return recovered, locator
+
+        try:
+            return invoke(part, label, max_tokens, response_mode="balanced"), True
+        except Exception as first_exc:  # noqa: BLE001 - isolate one failed part
+            last_traceback = traceback.format_exc()
+            salvaged, hint = capture_failure(first_exc)
+            effective_exc = first_exc
+            direct_retry_attempted = False
+
+            # A thinking-only response is not evidence that the input is too
+            # large. Retry the same bounded page range once with thinking off
+            # before multiplying requests through another split. This directly
+            # addresses Sonnet 5 consuming the shared output budget on thinking.
+            if _is_no_text_output_error(first_exc):
+                direct_retry_attempted = True
+                if retry_delay_seconds:
+                    time.sleep(retry_delay_seconds)
+                try:
+                    return invoke(
+                        part, label, max_tokens, response_mode="direct",
+                    ), True
+                except Exception as direct_exc:  # noqa: BLE001
+                    last_traceback = traceback.format_exc()
+                    direct_salvaged, direct_hint = capture_failure(direct_exc)
+                    if direct_salvaged:
+                        salvaged = direct_salvaged
+                    if direct_hint:
+                        hint = direct_hint
+                    effective_exc = direct_exc
+
+            can_split = (
+                _should_split_after_failure(effective_exc)
+                and depth < ADAPTIVE_SPLIT_MAX_DEPTH
+                and request_count < ADAPTIVE_SPLIT_MAX_REQUESTS_PER_CHUNK
+            )
+            split = _split_chunk_for_retry(part) if can_split else None
+            if split is not None:
+                adaptive_splits += 1
+                child_tokens = (
+                    max_tokens
+                    if _preserve_output_budget_after_split(effective_exc)
+                    else max(REVIEW_RETRY_MIN_TOKENS, max_tokens // 2)
+                )
+                findings: list[Finding] = []
+                all_complete = True
+                for child_no, child in enumerate(split, start=1):
+                    child_findings, child_complete = review_part(
+                        child,
+                        f"{label}.{child_no}",
+                        depth + 1,
+                        child_tokens,
+                    )
+                    findings.extend(child_findings)
+                    all_complete = all_complete and child_complete
+
+                # Prefer the smaller child calls to avoid duplicating the
+                # salvaged parent objects. Parent salvage is only a last resort
+                # when neither child yielded anything usable.
+                if not findings and salvaged:
+                    findings = salvaged
+                    parent_salvage_used = True
+                return findings, all_complete
+
+            # Thinking-only failures have already received their one direct
+            # retry above. Do not issue a third identical leaf request.
+            if direct_retry_attempted:
+                second_exc = effective_exc
+            else:
+                if retry_delay_seconds:
+                    time.sleep(retry_delay_seconds)
+                retry_tokens = (
+                    max_tokens
+                    if _preserve_output_budget_after_split(effective_exc)
+                    else max(REVIEW_RETRY_MIN_TOKENS, max_tokens // 2)
+                    if _should_split_after_failure(effective_exc)
+                    else max_tokens
+                )
+                try:
+                    retry_mode = (
+                        "direct" if _preserve_output_budget_after_split(effective_exc)
+                        else "balanced"
+                    )
+                    return invoke(
+                        part, label, retry_tokens, response_mode=retry_mode,
+                    ), True
+                except Exception as retry_exc:  # noqa: BLE001
+                    last_traceback = traceback.format_exc()
+                    retry_salvaged, retry_hint = capture_failure(retry_exc)
+                    if retry_salvaged:
+                        salvaged = retry_salvaged
+                    if retry_hint:
+                        hint = retry_hint
+                    second_exc = retry_exc
+
+            failure_types.append(type(second_exc).__name__)
+            failure_messages.append(f"{label} failed after retry/recovery: {second_exc}")
+            failed_parts.append({
+                "label": label,
+                **describe_pages(part),
+                "error_type": type(second_exc).__name__,
+                "error": str(second_exc),
+                "partial_findings_kept": len(salvaged),
+                "incomplete_finding_hint": hint,
+            })
+            return salvaged, False
+
+    label = f"chunk {i} of {total}"
+    findings, complete = review_part(chunk, label, depth=0, max_tokens=REVIEW_MAX_TOKENS)
     duration = round(time.perf_counter() - start, 1)
+    coverage = describe_pages(chunk)
+    timing = {
+        "chunk": i,
+        "total": total,
+        **coverage,
+        "duration_seconds": duration,
+        "attempts": request_count,
+        "adaptive_splits": adaptive_splits,
+        "input_chars": len(render_pages_as_text(chunk)),
+        "failed": not bool(findings) and not complete,
+        "partial": bool(findings) and not complete,
+    }
+
+    if complete:
+        return findings, None, timing
+
+    error_type = failure_types[-1] if failure_types else "AdaptiveSplitPartialFailure"
     error = {
         "chunk": i,
         "total": total,
-        "error": f"Chunk {i} of {total} failed after retry: {last_exc}",
-        "error_type": type(last_exc).__name__,
+        "error": (
+            f"Chunk {i} of {total} completed only partially after bounded adaptive recovery: "
+            + " | ".join(failure_messages or ["one or more split parts failed"])
+        ),
+        "error_type": error_type,
         "traceback": last_traceback,
-        "raw_response": raw,  # full text if the last attempt returned one but parsing failed
+        "raw_response": last_raw,
         "duration_seconds": duration,
-        "retry_used_reduced_tokens": tokens_for_attempt != REVIEW_MAX_TOKENS,
+        "partial_findings_kept": len(findings),
+        "adaptive_splits": adaptive_splits,
+        "request_count": request_count,
+        "coverage": coverage,
+        "failed_parts": failed_parts,
+        "response_hints": response_hints,
+        "parent_salvage_used": parent_salvage_used,
     }
-    timing = {"chunk": i, "total": total, "duration_seconds": duration, "attempts": 2, "failed": True}
-    return [], error, timing
+    return findings, error, timing
 
 
 def run_first_pass(config: LLMConfig, digest_pages: list[Page],

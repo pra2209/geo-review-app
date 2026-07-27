@@ -41,13 +41,17 @@ class LLMConfig:
 
 
 def call(config: LLMConfig, system_prompt: str, user_prompt: str,
-          max_tokens: int = 8192) -> str:
+         max_tokens: int = 8192, response_mode: str = "balanced") -> str:
     module = _PROVIDERS[config.provider]
-    return module.call(config.api_key, config.model, system_prompt, user_prompt, max_tokens)
+    return module.call(
+        config.api_key, config.model, system_prompt, user_prompt, max_tokens,
+        response_mode=response_mode,
+    )
 
 
 def call_with_cache(config: LLMConfig, system_prompt: str, cacheable_context: str,
-                     dynamic_content: str, max_tokens: int = 8192) -> str:
+                    dynamic_content: str, max_tokens: int = 8192,
+                    response_mode: str = "balanced") -> str:
     """Use when the same system_prompt + cacheable_context will be sent again
     on a subsequent call within the same job (e.g. one chunk call per section
     of a document, all sharing the same framework instructions + digest) -
@@ -55,8 +59,10 @@ def call_with_cache(config: LLMConfig, system_prompt: str, cacheable_context: st
     caching is actually achieved (explicit cache_control for Anthropic,
     automatic server-side for OpenAI and Gemini)."""
     module = _PROVIDERS[config.provider]
-    return module.call_with_cache(config.api_key, config.model, system_prompt,
-                                   cacheable_context, dynamic_content, max_tokens)
+    return module.call_with_cache(
+        config.api_key, config.model, system_prompt, cacheable_context,
+        dynamic_content, max_tokens, response_mode=response_mode,
+    )
 
 
 def validate_key(config: LLMConfig) -> tuple[bool, str]:

@@ -207,6 +207,21 @@ def get_text_coverage(job_id: str) -> Optional[dict]:
         return json.load(f)
 
 
+def save_review_coverage(job_id: str, iteration: int, coverage: dict):
+    """Persist the page/section-level completeness manifest for one review run."""
+    path = os.path.join(_job_dir(job_id), f"review_coverage_v{iteration}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(coverage, f, indent=2)
+
+
+def get_review_coverage(job_id: str, iteration: int) -> Optional[dict]:
+    path = os.path.join(_job_dir(job_id), f"review_coverage_v{iteration}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 # --- Findings & Excel per iteration ------------------------------------------
 
 def save_findings(job_id: str, iteration: int, findings: list[Finding]):

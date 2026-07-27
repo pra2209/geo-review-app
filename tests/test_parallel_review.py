@@ -44,7 +44,7 @@ def test_run_first_pass_preserves_chunk_order_despite_reversed_completion():
     ]
     digest = [_page("report.pdf", 0, "digest content")]
 
-    def fake_call_with_cache(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+    def fake_call_with_cache(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192, response_mode="balanced"):
         if "chunk 1 of 3" in dynamic_content:
             time.sleep(0.15)  # slowest - finishes LAST despite being submitted first
             return _finding_json("Finding from chunk 1")
@@ -75,7 +75,7 @@ def test_run_first_pass_runs_concurrently_not_sequentially():
     chunks = [[_page("report.pdf", i, f"content {i}")] for i in range(1, 4)]
     digest = [_page("report.pdf", 0, "digest")]
 
-    def fake_call_with_cache(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+    def fake_call_with_cache(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192, response_mode="balanced"):
         time.sleep(0.2)
         return _finding_json("Finding")
 
@@ -94,7 +94,7 @@ def test_process_one_chunk_retries_once_then_succeeds():
     chunk = [_page("report.pdf", 1, "content")]
     digest_calls = {"count": 0}
 
-    def flaky_call(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+    def flaky_call(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192, response_mode="balanced"):
         digest_calls["count"] += 1
         if digest_calls["count"] == 1:
             raise RuntimeError("simulated transient API error")
@@ -114,7 +114,7 @@ def test_process_one_chunk_retries_once_then_succeeds():
 def test_process_one_chunk_gives_up_after_two_failures():
     chunk = [_page("report.pdf", 1, "content")]
 
-    def always_fails(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+    def always_fails(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192, response_mode="balanced"):
         raise RuntimeError("persistent failure")
 
     with patch("src.review_pipeline.call_with_cache", side_effect=always_fails):
@@ -138,7 +138,7 @@ def test_process_one_chunk_captures_real_traceback_not_nonetype_none():
     context. Fix: capture it INSIDE the except block, while still valid."""
     chunk = [_page("report.pdf", 1, "content")]
 
-    def always_fails(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+    def always_fails(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192, response_mode="balanced"):
         raise RuntimeError("a distinctive failure message for this test")
 
     with patch("src.review_pipeline.call_with_cache", side_effect=always_fails):
@@ -170,7 +170,7 @@ def test_timeout_class_failure_retries_with_reduced_max_tokens():
     chunk = [_page("report.pdf", 1, "content")]
     calls = []
 
-    def fails_once_with_timeout(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+    def fails_once_with_timeout(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192, response_mode="balanced"):
         calls.append(max_tokens)
         if len(calls) == 1:
             raise _FakeAPITimeoutError("Request timed out")
@@ -196,7 +196,7 @@ def test_non_timeout_failure_retries_with_unchanged_max_tokens():
     chunk = [_page("report.pdf", 1, "content")]
     calls = []
 
-    def fails_once_not_timeout(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+    def fails_once_not_timeout(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192, response_mode="balanced"):
         calls.append(max_tokens)
         if len(calls) == 1:
             raise RuntimeError("429 rate limited")
@@ -222,7 +222,7 @@ def test_cancellation_stops_not_yet_started_chunks_but_keeps_completed_findings(
     digest = [_page("report.pdf", 0, "digest")]
     calls_made = {"count": 0}
 
-    def fake_call_with_cache(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192):
+    def fake_call_with_cache(config, system_prompt, cacheable_context, dynamic_content, max_tokens=8192, response_mode="balanced"):
         calls_made["count"] += 1
         time.sleep(0.1)
         return _finding_json("Finding")

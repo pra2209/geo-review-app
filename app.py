@@ -16,10 +16,18 @@ from src.config import ALLOWED_MODELS, CHUNK_CONCURRENCY, DEFAULT_MODEL, MAX_FIL
 from src import job_store
 from src.excel_io import write_excel, read_reviewer_comments, DISCLAIMER
 from src.llm_client import LLMConfig, validate_key
-from src.pdf_processing import (extract_all, build_digest, chunk_pages,
-                                 get_and_clear_extraction_warnings, compute_text_coverage,
-                                 MIN_MEANINGFUL_CHARS_PER_PAGE)
+from src.pdf_processing import (
+    MIN_MEANINGFUL_CHARS_PER_PAGE,
+    build_digest,
+    chunk_pages,
+    compute_text_coverage,
+    describe_pages,
+    extract_all,
+    get_and_clear_extraction_warnings,
+    render_pages_as_text,
+)
 from src.review_pipeline import load_framework, run_first_pass, run_iteration, Finding
+from src.review_coverage import build_review_coverage
 from src.summary import generate_summary
 
 st.set_page_config(page_title="Geotechnical Report Review", layout="wide")
@@ -29,6 +37,75 @@ STATUS_LABELS = {
     "A": "Proceed", "E": "Not Required",
 }
 
+
+
+def _section_hints_text(entry: dict) -> str:
+    hints = entry.get("section_hints") or []
+    if not hints:
+        return "Not detected — use PDF page numbers"
+    return "; ".join(
+        f"{hint['section_no']} {hint['title']} (p.{hint['page']})"
+        for hint in hints
+    )
+
+
+def _render_review_coverage(coverage: dict | None):
+    if not coverage:
+        return
+    if coverage.get("is_complete"):
+        st.success(
+            f"Review coverage: all {coverage.get('total_pages', 0)} extracted PDF pages "
+            "completed successfully."
+        )
+        return
+
+    failed = coverage.get("failed_pages", 0)
+    partial = coverage.get("partial_pages", 0)
+    complete = coverage.get("complete_pages", 0)
+    st.error(
+        "Review coverage is incomplete. "
+        f"Fully reviewed: {complete} page(s); not reliably reviewed: {failed} page(s); "
+        f"partially reviewed: {partial} page(s). Treat failed ranges as unreviewed and "
+        "partial ranges as not guaranteed exhaustive."
+    )
+
+    rows = []
+    for entry in coverage.get("entries", []):
+        if entry.get("status") == "complete":
+            continue
+        failed_parts = entry.get("failed_parts") or []
+        failed_ranges = ", ".join(
+            f"{part.get('label')}: pages {part.get('page_label') or '?'}"
+            for part in failed_parts
+        ) or f"pages {entry.get('page_label') or '?'}"
+        hints = entry.get("response_hints") or []
+        known_hint = "; ".join(
+            " / ".join(filter(None, [
+                hint.get("page_or_item", ""),
+                f"Section {hint.get('section_no')}" if hint.get("section_no") else "",
+                hint.get("snapshot", ""),
+            ]))
+            for hint in hints
+        ) or "No incomplete finding locator recovered"
+        rows.append({
+            "Coverage": entry.get("status", "").upper(),
+            "Source file": entry.get("source_file", ""),
+            "Chunk pages": entry.get("page_label", ""),
+            "Unreviewed pages": entry.get("failed_page_label", "") or "—",
+            "Partially reviewed pages": entry.get("partial_page_label", "") or "—",
+            "Failed sub-ranges": failed_ranges,
+            "Detected sections": _section_hints_text(entry),
+            "Recovered findings": entry.get("partial_findings_kept", 0),
+            "Known unfinished item": known_hint,
+        })
+
+    with st.expander("Review coverage details — pages and sections requiring attention", expanded=True):
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.caption(
+            "Section names are best-effort headings extracted from selectable PDF text. "
+            "The PDF page range is the authoritative locator. Technical provider details "
+            "remain available in the downloadable debug log."
+        )
 
 def _get_secret(key: str, default=None):
     """st.secrets.get(...) raises StreamlitSecretNotFoundError - not just
@@ -310,6 +387,22 @@ def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, it
             _log_extraction_warnings(job_id, "reviewing")
             digest = build_digest(pages)
             chunks = chunk_pages(pages)
+            # Record the actual bounded request plan. This contains no API key
+            # or PDF binary, but filenames are retained for source traceability.
+            job_store.append_debug_event(job_id, {
+                "stage": "review_plan",
+                "source_files": list(dict.fromkeys(page.source_file for page in pages)),
+                "extracted_pages": len(pages),
+                "digest_fragments": len(digest),
+                "digest_chars": len(render_pages_as_text(digest)),
+                "chunk_count": len(chunks),
+                "chunk_chars": [len(render_pages_as_text(chunk)) for chunk in chunks],
+                "chunk_fragments": [len(chunk) for chunk in chunks],
+                "chunks": [
+                    {"chunk": index, **describe_pages(chunk)}
+                    for index, chunk in enumerate(chunks, start=1)
+                ],
+            })
 
             def progress_cb(done, total):
                 job_store.set_status(job_id, "reviewing",
@@ -320,6 +413,8 @@ def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, it
                 config, digest, chunks, extra_instructions or None, progress_cb=progress_cb,
                 cancel_check=lambda: job_store.is_cancel_requested(job_id))
             total_duration = round(time.time() - run_start, 1)
+            coverage = build_review_coverage(chunks, chunk_errors, chunk_timings)
+            job_store.save_review_coverage(job_id, iteration, coverage)
 
             for ce in chunk_errors:
                 job_store.append_debug_event(job_id, {"stage": "reviewing_chunk", **ce,
@@ -333,6 +428,8 @@ def _start_review_bg(job_id: str, config: LLMConfig, extra_instructions: str, it
                 "workers": CHUNK_CONCURRENCY,
                 "chunks_failed": len(chunk_errors),
                 "chunk_durations_seconds": [t["duration_seconds"] for t in chunk_timings],
+                "llm_request_count": sum(t.get("attempts", 0) for t in chunk_timings),
+                "adaptive_splits": sum(t.get("adaptive_splits", 0) for t in chunk_timings),
                 "cancelled": cancelled,
             })
 
@@ -454,6 +551,7 @@ def render_results_screen(job_id: str, config: LLMConfig | None, iteration: int,
     findings = job_store.get_findings(job_id, iteration) or []
     excel_bytes = job_store.get_excel(job_id, iteration)
     warnings = job_store.get_warnings(job_id, iteration)
+    coverage = job_store.get_review_coverage(job_id, iteration)
     iteration_error = job_store.pop_iteration_error(job_id)
 
     if iteration_error:
@@ -462,6 +560,7 @@ def render_results_screen(job_id: str, config: LLMConfig | None, iteration: int,
         _debug_log_download_button(job_id, key="iteration_error_debug_log")
 
     st.header(f"5. Results (iteration {iteration})")
+    _render_review_coverage(coverage)
     run_stats = job_store.get_run_stats(job_id, iteration)
     if run_stats:
         total_s = run_stats["total_duration_seconds"]
@@ -473,15 +572,15 @@ def render_results_screen(job_id: str, config: LLMConfig | None, iteration: int,
             f"{run_stats['chunks_failed']} needed a retry{slowest})."
         )
     if warnings:
-        with st.expander(f"⚠️ {len(warnings)} section(s) had a problem and were skipped "
-                          "(findings below are still complete for everything that succeeded)",
-                          expanded=False):
+        with st.expander(
+            "Technical failure messages",
+            expanded=False,
+        ):
             for w in warnings:
                 st.warning(w)
             st.caption(
-                "This usually means the model's response for that section got cut off. "
-                "Re-running the review (or a Revise Review iteration once the rest looks good) "
-                "will retry that content."
+                "Use the coverage panel above for the authoritative PDF page ranges. "
+                "These messages are retained for technical diagnosis."
             )
             _debug_log_download_button(job_id, key="warnings_debug_log")
     counts = {}
@@ -532,7 +631,14 @@ def render_results_screen(job_id: str, config: LLMConfig | None, iteration: int,
             _start_iteration_bg(job_id, config, overarching, reviewer_comments, iteration + 1)
             st.rerun()
     with col2:
-        if st.button("I'm satisfied — Finish"):
+        has_gaps = bool(coverage and not coverage.get("is_complete"))
+        acknowledged = True
+        if has_gaps:
+            acknowledged = st.checkbox(
+                "I acknowledge the unreviewed/partial page ranges above",
+                key=f"coverage_ack_{iteration}",
+            )
+        if st.button("I'm satisfied — Finish", disabled=has_gaps and not acknowledged):
             job_store.set_status(job_id, "finished", stage="Finished", current=1, total=1)
             st.rerun()
 
@@ -562,6 +668,7 @@ def main():
 
     if status["status"] == "error":
         st.error(f"Something went wrong: {status['error_message']}")
+        _render_review_coverage(job_store.get_review_coverage(job_id, status.get("iteration", 1) or 1))
         _debug_log_download_button(job_id, key="error_screen_debug_log")
         if st.button("Start over"):
             st.session_state.pop("job_id", None)

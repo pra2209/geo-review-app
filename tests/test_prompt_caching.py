@@ -19,11 +19,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.providers import anthropic_provider, openai_provider, gemini_provider
 
 
-def _mock_anthropic_stream(instance, text="[]"):
-    """client.messages.stream(...) is a context manager; stream.get_final_text()
-    returns the accumulated text. Configure the mock to behave that way."""
+def _mock_anthropic_stream(instance, text="[]", block_type="text",
+                             stop_reason="end_turn", output_tokens=10):
+    """Simulate Anthropic's final streamed Message object."""
     stream_cm = MagicMock()
-    stream_cm.__enter__.return_value.get_final_text.return_value = text
+    block = MagicMock()
+    block.type = block_type
+    block.text = text if block_type == "text" else None
+    message = MagicMock()
+    message.content = [block]
+    message.stop_reason = stop_reason
+    message.usage.output_tokens = output_tokens
+    stream_cm.__enter__.return_value.get_final_message.return_value = message
     instance.messages.stream.return_value = stream_cm
 
 
@@ -51,6 +58,8 @@ def test_anthropic_call_with_cache_marks_system_and_context_as_ephemeral():
             max_tokens=1234,
         )
 
+        assert MockClient.call_args.kwargs["max_retries"] == 0, \
+            "application retry logic must be the only retry owner"
         call_kwargs = instance.messages.stream.call_args.kwargs
 
         # System prompt must be a cache-marked content block, not a plain string,
@@ -69,6 +78,11 @@ def test_anthropic_call_with_cache_marks_system_and_context_as_ephemeral():
         assert "cache_control" not in content_blocks[1], "dynamic content must NOT be cached"
 
         assert call_kwargs["max_tokens"] == 1234
+        assert call_kwargs["thinking"] == {"type": "adaptive"}
+        assert call_kwargs["output_config"]["effort"] == "medium"
+        output_format = call_kwargs["output_config"]["format"]
+        assert output_format["type"] == "json_schema"
+        assert output_format["schema"]["type"] == "array"
         print("test_anthropic_call_with_cache_marks_system_and_context_as_ephemeral: OK")
 
 
@@ -99,6 +113,46 @@ def test_anthropic_call_with_cache_is_stable_across_repeated_calls():
         print("test_anthropic_call_with_cache_is_stable_across_repeated_calls: OK")
 
 
+
+
+def test_anthropic_direct_retry_disables_thinking_but_keeps_medium_effort():
+    with patch("src.providers.anthropic_provider.Anthropic") as MockClient:
+        instance = MockClient.return_value
+        _mock_anthropic_stream(instance)
+
+        anthropic_provider.call_with_cache(
+            api_key="fake-key", model="claude-sonnet-5",
+            system_prompt="FRAMEWORK", cacheable_context="DIGEST",
+            dynamic_content="CHUNK", max_tokens=12000, response_mode="direct",
+        )
+
+        call_kwargs = instance.messages.stream.call_args.kwargs
+        assert call_kwargs["thinking"] == {"type": "disabled"}
+        assert call_kwargs["output_config"]["effort"] == "medium"
+        assert call_kwargs["output_config"]["format"]["type"] == "json_schema"
+
+
+def test_anthropic_thinking_only_response_has_actionable_metadata():
+    with patch("src.providers.anthropic_provider.Anthropic") as MockClient:
+        instance = MockClient.return_value
+        _mock_anthropic_stream(
+            instance, text="", block_type="thinking",
+            stop_reason="max_tokens", output_tokens=6000,
+        )
+        try:
+            anthropic_provider.call_with_cache(
+                api_key="fake-key", model="claude-sonnet-5",
+                system_prompt="FRAMEWORK", cacheable_context="DIGEST",
+                dynamic_content="CHUNK", max_tokens=6000,
+            )
+            raise AssertionError("expected NoTextResponseError")
+        except anthropic_provider.NoTextResponseError as exc:
+            message = str(exc)
+            assert "thinking" in message
+            assert "max_tokens" in message
+            assert "6000" in message
+
+
 def test_openai_call_with_cache_preserves_prefix_order():
     """OpenAI's caching is automatic and prefix-based - our job is just to
     keep the same block order/content every call. Verify the concatenation
@@ -114,6 +168,8 @@ def test_openai_call_with_cache_preserves_prefix_order():
             dynamic_content="CHUNK 1",
         )
 
+        assert MockClient.call_args.kwargs["max_retries"] == 0, \
+            "application retry logic must be the only retry owner"
         call_kwargs = instance.chat.completions.create.call_args.kwargs
         assert call_kwargs["stream"] is True, "must request a streaming response"
         user_message = call_kwargs["messages"][1]["content"]
@@ -133,6 +189,7 @@ def test_gemini_uses_google_endpoint_not_openais():
         gemini_provider.call(api_key="fake-gemini-key", model="gemini-2.5-pro",
                               system_prompt="sys", user_prompt="usr")
         _, kwargs = MockClient.call_args
+        assert kwargs["max_retries"] == 0
         assert kwargs["base_url"] == gemini_provider.GEMINI_BASE_URL
         assert "openai.com" not in kwargs["base_url"]
         print("test_gemini_uses_google_endpoint_not_openais: OK")
@@ -159,6 +216,8 @@ def test_gemini_call_with_cache_preserves_prefix_order():
 if __name__ == "__main__":
     test_anthropic_call_with_cache_marks_system_and_context_as_ephemeral()
     test_anthropic_call_with_cache_is_stable_across_repeated_calls()
+    test_anthropic_direct_retry_disables_thinking_but_keeps_medium_effort()
+    test_anthropic_thinking_only_response_has_actionable_metadata()
     test_openai_call_with_cache_preserves_prefix_order()
     test_gemini_uses_google_endpoint_not_openais()
     test_gemini_call_with_cache_preserves_prefix_order()

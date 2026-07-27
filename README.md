@@ -193,12 +193,31 @@ several minutes to produce a large, thorough finding set.
 instead of the old blocking one (same assertions - cache_control placement,
 base_url, prefix ordering - just against the new interface).
 `tests/test_streaming_accumulation.py` is new and tests the hand-written
-delta-accumulation logic specifically (Anthropic delegates accumulation to
-the SDK's `get_final_text()`, which doesn't need re-testing here; the
-OpenAI/Gemini manual chunk-joining loop is code we wrote and could get
-wrong - multiple chunks in order, and chunks with no delta content at all,
-which real streams send constantly for role-only/finish-reason-only
-frames).
+delta-accumulation logic specifically for OpenAI/Gemini: multiple deltas in
+order and frames with no text content at all.
+
+**A sixth incident, specific to Claude Sonnet 5 adaptive thinking**: a
+27-page report was planned as pages 1-12, 13-24, and 25-27. Pages 13-24
+ultimately produced no usable findings, while pages 25-27 produced only five
+complete findings before the JSON ended. The provider did not time out: it
+returned successful messages containing only `thinking` blocks, and the old
+wrapper called `get_final_text()`, which raises when no `text` block exists.
+The underlying problem was output-budget starvation: Sonnet 5 enables
+adaptive thinking by default, and thinking plus visible JSON share
+`max_tokens`. The old recovery then halved that budget after splitting,
+which made a visible answer still less likely.
+
+Fixed by reading the final Anthropic Message directly (preserving block types,
+`stop_reason`, and usage), setting explicit medium effort, using strict JSON
+structured output for review calls, and retrying a thinking-only response once
+with thinking disabled before splitting. Truncated/partial-output splits keep
+the full JSON budget; pure timeouts may still lower it. The app now persists a
+page-level coverage manifest and shows exact complete, partial, and unreviewed
+PDF ranges plus best-effort section headings and any locator recovered from an
+unfinished finding. A result with gaps cannot be marked finished without an
+explicit user acknowledgement. Regression coverage is in
+`tests/test_chunking_resilience.py`, `tests/test_prompt_caching.py`, and
+`tests/test_review_coverage.py`.
 
 ## Latency
 
@@ -214,22 +233,29 @@ with no explicit request timeout. Fixed via:
   first (`tests/test_parallel_review.py` proves this with reversed completion
   order, and separately proves the concurrency is real - 3 mocked 0.2s chunks
   finish in ~0.2s total, not ~0.6s).
-- **Larger chunk budget** (`DEFAULT_CHUNK_CHAR_BUDGET` in `src/pdf_processing.py`,
-  40k → 80k chars): all three allowlisted providers now support ~1M-token
-  context windows, so the old budget was chunking - and round-tripping - far
-  more granularly than needed.
-- **One short retry per chunk** on failure (`_process_one_chunk` in
-  `review_pipeline.py`) before giving up - covers transient/rate-limit blips,
-  which are more likely now that requests go out concurrently.
+- **Bounded request planning** (`src/pdf_processing.py`): detailed review
+  chunks are capped at 45k rendered characters and 12 page fragments, never
+  cross source-file boundaries, and split a single text-dense PDF page
+  losslessly instead of letting it bypass the budget. The repeated project
+  digest is independently capped at 30k rendered characters across all files;
+  previously `20 pages/file` could silently add up to 100 repeated pages on
+  every request.
+- **Adaptive recovery** (`_process_one_chunk` in `review_pipeline.py`):
+  timeout, request-size, and truncated-output failures recursively bisect the
+  input and review smaller child sections instead of repeating the identical
+  request. Depth and provider-call count are bounded, and successful sibling
+  findings are kept if another child ultimately fails.
+- **Single retry owner**: automatic SDK retries are disabled so the app's
+  split/retry policy cannot be invisibly multiplied by provider-library
+  retries.
 - **Explicit request timeout** (`LLM_REQUEST_TIMEOUT_SECONDS`, 150s) on every
   provider call - previously unset, relying on SDK defaults that can run
   several minutes, meaning one stuck call could quietly eat most of a job's
   wall-clock.
-- **Per-chunk timing capture**: every chunk's duration (success or failure)
-  is logged to the debug log, and a "Completed in Xm Ys across N chunks"
-  summary shows on the results screen - so a future "why did this take so
-  long" question comes with real data, not a guess. The progress screen also
-  shows live elapsed time.
+- **Request-plan and timing capture**: the debug log records digest size,
+  per-chunk rendered size/page-fragment count, request count, adaptive split
+  count, and duration. The results screen still shows the total elapsed time,
+  so a future latency failure can be diagnosed from the real request shape.
 
 **Not built (needs a product decision, not just an engineering fix)**: a
 "fast mode" that trades review depth for speed on very large documents -
@@ -249,13 +275,14 @@ owns review quality, not something to decide unilaterally in code.
   `tests/test_prompt_caching.py` (can't verify an actual cache *hit* without
   a live key — that shows up in the provider's usage dashboard as
   `cache_read_input_tokens` / cached-token counts on the 2nd+ call).
-- **Per-chunk resilience**: if one chunk's response gets cut off (hit the
-  token limit) or otherwise fails to parse, that chunk's findings are
-  skipped — every other chunk's findings (already paid for) are kept, not
-  discarded. Partial results are surfaced as dismissable warnings on the
-  results screen, not a job-killing error. Same principle applies to a failed
-  "Revise Review" iteration: it falls back to your last successful result
-  instead of a dead-end error screen.
+- **Per-chunk resilience and transparent coverage**: timeout, thinking-only,
+  request-size, and truncated-output failures are recovered with bounded
+  direct retries and/or smaller page ranges. Findings from successful siblings
+  are kept. Any remaining gap is persisted as a coverage manifest and shown as
+  exact complete, partial, or unreviewed PDF page ranges; it is not hidden
+  behind a generic chunk warning. Same principle applies to a failed "Revise
+  Review" iteration: it falls back to the last successful result instead of a
+  dead-end error screen.
 - **Debug log**: any error or per-chunk warning gets a "Download error log"
   button next to it — a JSON bundle with full traceback, the raw model
   response where available, and provider/model (never your API key or PDF
@@ -320,15 +347,16 @@ the current functions are already structured to make that split easy later.
 
 ## Known TODOs before this is "done" rather than "working"
 
-- Tests cover Excel round-trip, JSON-truncation salvage/error behavior,
-  caching request payloads, and chunk concurrency/ordering/retry (`tests/`) —
-  not yet: `pdf_processing`, `job_store`, or the Streamlit screens themselves
-  (those were smoke-tested manually against a real DP05 report, not under
-  automated test).
-- One retry per chunk, not a full retry-with-backoff policy — a chunk that
-  fails twice is skipped and surfaced as a warning; retrying it beyond that
-  means re-running the review or a Revise Review iteration, not further
-  automatic in-job retries.
+- Tests cover Excel round-trip/injection defense, JSON truncation,
+  provider streaming/prompt shape, parallel ordering, bounded/lossless PDF
+  chunking, multi-file digest limits, recursive timeout splitting, partial
+  child recovery, scanned-page detection, and fresh-database startup. The
+  Streamlit screens themselves still require a real browser smoke test after
+  UI changes.
+- Chunk planning is deliberately provider-neutral and character-based rather
+  than exact-token-based. The independent 30k digest and 45k detailed limits
+  keep requests predictable across all three providers; provider token-count
+  telemetry remains a useful future enhancement.
 - No rate limiting / abuse protection beyond the shared access code — worth
   revisiting alongside `CHUNK_CONCURRENCY` if this sees real multi-user
   traffic, since concurrent requests per job now multiply by concurrent
